@@ -1,0 +1,4 @@
+interface:
+  display_name: "Notebook Coach"
+  short_description: "Diagnose and recheck learning evidence in Jupyter notebooks"
+  default_prompt: "Use $notebook-coach to diagnose and coach this Jupyter notebook."
