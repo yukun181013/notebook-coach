@@ -7,6 +7,9 @@ import nbformat
 import pytest
 from nbformat import NotebookNode
 
+from notebook_coach import SCHEMA_VERSION
+from notebook_coach.sanitize import redact_text, summarize_text
+
 
 @pytest.fixture
 def notebook_factory(
@@ -72,3 +75,49 @@ def notebook_factory(
         return path
 
     return make_notebook
+
+
+@pytest.fixture
+def snapshot_factory() -> Callable[[list[str]], dict]:
+    """Build deterministic Task 3-shaped snapshots without writing notebooks."""
+
+    def make_snapshot(sources: list[str]) -> dict:
+        labels: set[str] = set()
+        redacted_fields = 0
+        cells = []
+
+        for index, source in enumerate(sources):
+            _, source_labels = redact_text(source)
+            if source_labels:
+                labels.update(source_labels)
+                redacted_fields += 1
+            cells.append(
+                {
+                    "index": index,
+                    "cell_type": "code",
+                    "source": summarize_text(source, max_chars=150_000),
+                    "execution_count": None,
+                    "outputs": [],
+                }
+            )
+
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "source": {
+                "sha256": "0" * 64,
+                "cell_count": len(cells),
+                "kernel_name": "python3",
+                "language": "python",
+                "nbformat": 4,
+                "nbformat_minor": 5,
+            },
+            "cells": cells,
+            "sanitization": {
+                "labels": sorted(labels),
+                "redacted_fields": redacted_fields,
+                "truncated_fields": 0,
+                "omitted_binary_fields": 0,
+            },
+        }
+
+    return make_snapshot
