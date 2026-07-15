@@ -16,6 +16,7 @@ from notebook_coach.execution import (
     prepare_execution,
 )
 from notebook_coach.notebooks import NotebookInputError
+from notebook_coach.revisions import RevisionError, apply_execution_review
 from notebook_coach.runs import (
     AmbiguousRunError,
     RunNotFoundError,
@@ -150,6 +151,15 @@ def _handle_finalize_verification(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _handle_apply_execution_review(args: argparse.Namespace) -> dict[str, Any]:
+    result = apply_execution_review(args.run, args.log, args.review)
+    return {
+        "status": "revised",
+        "revision": result.revision,
+        "report_path": str(result.report_path.resolve()),
+    }
+
+
 def _handle_not_implemented(_args: argparse.Namespace) -> dict[str, Any]:
     raise WorkflowError(
         "not_implemented", "This command is not available in the static MVP."
@@ -219,6 +229,12 @@ def build_parser() -> argparse.ArgumentParser:
     finalize_verification_parser.add_argument("--stage", required=True)
     finalize_verification_parser.set_defaults(handler=_handle_finalize_verification)
 
+    apply_review_parser = subparsers.add_parser("apply-execution-review")
+    apply_review_parser.add_argument("--run", required=True)
+    apply_review_parser.add_argument("--log", required=True)
+    apply_review_parser.add_argument("--review", required=True)
+    apply_review_parser.set_defaults(handler=_handle_apply_execution_review)
+
     implemented = {
         "prepare-diagnosis",
         "finalize-diagnosis",
@@ -229,6 +245,7 @@ def build_parser() -> argparse.ArgumentParser:
         "cancel-execution",
         "prepare-verification",
         "finalize-verification",
+        "apply-execution-review",
     }
     for command in COMMANDS:
         if command in implemented:
@@ -258,6 +275,11 @@ def main(argv: list[str] | None = None) -> int:
             {"code": error.code, "message": str(error)}, stream=sys.stderr
         )
         return 4
+    except RevisionError as error:
+        _print_json(
+            {"code": error.code, "message": str(error)}, stream=sys.stderr
+        )
+        return 2
     except ConfirmationRequiredError as error:
         _print_json(
             {"code": error.code, "message": str(error), **error.details},

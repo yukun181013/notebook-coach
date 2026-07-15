@@ -128,7 +128,16 @@ def render_report(
             "No notebook code was executed. Findings use source and saved-output evidence only."
         )
     else:
-        lines.extend(f"- {review['summary']}" for review in reviews)
+        for review in reviews:
+            lines.append(
+                f"- {review['attempt_id']} ({review['target']}): "
+                f"{review['execution_log']}"
+            )
+            for update in review.get("issue_updates", []):
+                lines.append(
+                    f"  - {update['issue_id']} [{update['evidence_label']}]: "
+                    f"{update['evidence']}"
+                )
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -262,7 +271,20 @@ def render_verification(state: dict[str, Any]) -> str:
     )
     reviews = state.get("execution_reviews", [])
     if reviews:
-        lines.extend(f"- {review['summary']}" for review in reviews)
+        for review in reviews:
+            lines.append(
+                f"- {review['attempt_id']} ({review['target']}): "
+                f"{review['execution_log']}"
+            )
+            for update in [
+                *review.get("issue_updates", []),
+                *review.get("challenge_updates", []),
+            ]:
+                identifier = update.get("issue_id", update.get("challenge_id"))
+                lines.append(
+                    f"  - {identifier} [{update['evidence_label']}]: "
+                    f"{update['evidence']}"
+                )
     else:
         lines.append(
             "No notebook code was executed for this verification revision."
