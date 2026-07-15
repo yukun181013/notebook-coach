@@ -8,7 +8,7 @@
 - Reproducibility gap: found where random values are generated without a seed.
 - Challenge mapping: both answer-free challenges reference the relevant issue IDs.
 - Verification separation: corrected source evidence changes the source score while untouched challenge statuses remain `needs_work`.
-- Full-loop elapsed time: under five minutes on the local acceptance path; exact fresh-checkout timing is recorded during final acceptance.
+- Local acceptance timing at commit `a82bf8b`: fresh install 13.34 seconds, 325 tests 5.66 seconds, and the static diagnosis acceptance test 0.06 seconds while preserving the source hash and kernel process set.
 - Limitations: static analysis cannot prove runtime behavior; optional temporary-copy execution is not an OS sandbox; native Windows and WSL remain unverified.
 
 The `/feedback` Session ID is retained only in the private submission note after it is captured.

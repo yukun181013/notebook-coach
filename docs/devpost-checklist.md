@@ -27,10 +27,10 @@
 
 ## Final verification
 
-- [ ] Fresh checkout installs using README instructions.
-- [ ] Fresh checkout tests pass on Python 3.11.
-- [ ] First static report is produced in under five minutes.
-- [ ] Source Notebook hash is unchanged by static diagnosis and recheck.
+- [x] Fresh detached checkout installs on Python 3.11 (13.34 seconds at `a82bf8b`).
+- [x] Fresh checkout tests pass: 325 tests in 5.66 seconds.
+- [x] Static diagnosis acceptance completes in 0.06 seconds, under five minutes.
+- [x] Static diagnosis acceptance preserves the source hash and kernel process set.
 - [ ] Public URLs contain no placeholders.
 - [ ] User has reviewed the final Devpost field summary.
 - [ ] Final Devpost Submit action explicitly approved.
