@@ -638,6 +638,11 @@ class _RiskVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:
+        if isinstance(node.value, ast.GeneratorExp) and any(
+            isinstance(target, (ast.List, ast.Tuple, ast.Starred))
+            for target in node.targets
+        ):
+            self._record_potential_exception()
         self.generic_visit(node)
         identity = self._path_identity(node.value)
         for target in node.targets:

@@ -377,6 +377,31 @@ def test_try_handler_ignores_uniterated_safe_literal_generator_creation(
     assert result == {"blocked": False, "findings": []}
 
 
+@pytest.mark.parametrize(
+    "target",
+    ["[item]", "(item,)", "item, *rest"],
+    ids=["list", "tuple", "starred"],
+)
+def test_try_handler_records_generator_consumed_by_unpacking_assignment(
+    snapshot_factory: SnapshotFactory,
+    target: str,
+):
+    source = (
+        "from pathlib import Path\n"
+        "try:\n"
+        "    p = Path('/tmp/x')\n"
+        f"    {target} = (1 / 0 for _ in (1,))\n"
+        "    p = None\n"
+        "except ZeroDivisionError:\n"
+        "    p.unlink()"
+    )
+
+    result = scan_snapshot(snapshot_factory([source]))
+
+    assert _finding_for(result, "filesystem_delete")["severity"] == "high"
+    assert result["blocked"] is True
+
+
 def test_try_handler_uses_only_states_before_potential_exceptions(
     snapshot_factory: SnapshotFactory,
 ):
