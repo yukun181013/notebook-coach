@@ -26,6 +26,7 @@ _SUBPROCESS_CALLS = {
 }
 _PATH_DELETE_METHODS = {"rmdir", "unlink"}
 _PATH_READ_METHODS = {"open", "read_bytes", "read_text"}
+_VALID_CELL_TYPES = {"code", "markdown", "raw"}
 
 _SEVERITIES = {
     "credential_read": "high",
@@ -136,6 +137,7 @@ class _RiskVisitor(ast.NodeVisitor):
         self.categories: set[str] = set()
         self.module_aliases: dict[str, str] = {}
         self.imported_names: dict[str, str] = {}
+        self.path_instances: set[str] = set()
 
     def _resolve_name(self, node: ast.AST) -> str | None:
         name = _qualified_name(node)
@@ -145,6 +147,9 @@ class _RiskVisitor(ast.NodeVisitor):
         if name in self.imported_names:
             return self.imported_names[name]
         root, separator, remainder = name.partition(".")
+        imported_name = self.imported_names.get(root)
+        if imported_name is not None:
+            return imported_name + (separator + remainder if separator else "")
         module = self.module_aliases.get(root)
         if module is not None:
             return module + (separator + remainder if separator else "")
@@ -163,6 +168,16 @@ class _RiskVisitor(ast.NodeVisitor):
         if not node.args:
             return None
         return _literal_path(node.args[0])
+
+    def _bind_path_target(self, target: ast.AST, *, is_path: bool) -> None:
+        if isinstance(target, ast.Name):
+            if is_path:
+                self.path_instances.add(target.id)
+            else:
+                self.path_instances.discard(target.id)
+        elif isinstance(target, (ast.List, ast.Tuple)):
+            for element in target.elts:
+                self._bind_path_target(element, is_path=is_path)
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
@@ -190,6 +205,19 @@ class _RiskVisitor(ast.NodeVisitor):
             self.imported_names[local_name] = f"{module}.{alias.name}"
         self.generic_visit(node)
 
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.generic_visit(node)
+        is_path = self._is_path_constructor_call(node.value)
+        for target in node.targets:
+            self._bind_path_target(target, is_path=is_path)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self.generic_visit(node)
+        is_path = self._resolve_name(node.annotation) == "pathlib.Path" or (
+            node.value is not None and self._is_path_constructor_call(node.value)
+        )
+        self._bind_path_target(node.target, is_path=is_path)
+
     def visit_Call(self, node: ast.Call) -> None:
         call_name = self._resolve_name(node.func)
 
@@ -208,7 +236,15 @@ class _RiskVisitor(ast.NodeVisitor):
             receiver = node.func.value
             if (
                 node.func.attr in _PATH_DELETE_METHODS
-                and self._is_path_constructor_call(receiver)
+                and (
+                    self._is_path_constructor_call(receiver)
+                    or (
+                        isinstance(receiver, ast.Name)
+                        and receiver.id in self.path_instances
+                    )
+                    or call_name
+                    == f"pathlib.Path.{node.func.attr}"
+                )
             ):
                 self.categories.add("filesystem_delete")
             if node.func.attr in _PATH_READ_METHODS:
@@ -288,14 +324,26 @@ def scan_snapshot(snapshot: Any) -> dict[str, Any]:
     """Return deterministic static findings without executing notebook code."""
 
     findings: list[dict[str, Any]] = []
+    seen_indexes: set[int] = set()
     for cell in _validated_cells(snapshot):
         cell_index = cell.get("index")
-        if isinstance(cell_index, bool) or not isinstance(cell_index, int):
-            raise ValueError("snapshot cell index must be an integer.")
+        if (
+            isinstance(cell_index, bool)
+            or not isinstance(cell_index, int)
+            or cell_index < 0
+        ):
+            raise ValueError("snapshot cell index must be a non-negative integer.")
+        if cell_index in seen_indexes:
+            raise ValueError("snapshot contains a duplicate cell index.")
+        seen_indexes.add(cell_index)
 
         cell_type = cell.get("cell_type")
         if not isinstance(cell_type, str):
             raise ValueError("snapshot cell_type must be a string.")
+        if cell_type not in _VALID_CELL_TYPES:
+            raise ValueError(
+                "snapshot cell_type must be code, markdown, or raw."
+            )
         if cell_type != "code":
             continue
 

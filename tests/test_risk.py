@@ -106,6 +106,74 @@ def test_ast_detects_filesystem_delete_calls(
 
 
 @pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "from pathlib import Path\n"
+            "target = Path('/tmp/x')\n"
+            "target.unlink()"
+        ),
+        (
+            "from pathlib import Path\n"
+            "target = Path('/tmp/x')\n"
+            "target.rmdir()"
+        ),
+        "from pathlib import Path\nPath.unlink(Path('/tmp/x'))",
+        "from pathlib import Path\nPath.rmdir(Path('/tmp/x'))",
+        (
+            "from pathlib import Path as P\n"
+            "target: P = P('/tmp/x')\n"
+            "target.unlink()"
+        ),
+        (
+            "import pathlib as paths\n"
+            "target: paths.Path = paths.Path('/tmp/x')\n"
+            "target.rmdir()"
+        ),
+    ],
+)
+def test_ast_tracks_path_instances_and_class_method_delete_calls(
+    snapshot_factory: SnapshotFactory,
+    source: str,
+):
+    result = scan_snapshot(snapshot_factory([source]))
+
+    assert _finding_for(result, "filesystem_delete")["severity"] == "high"
+    assert result["blocked"] is True
+
+
+def test_path_tracking_does_not_flag_arbitrary_same_named_methods(
+    snapshot_factory: SnapshotFactory,
+):
+    snapshot = snapshot_factory(
+        [
+            (
+                "from pathlib import Path\n"
+                "target = Path('/tmp/x')\n"
+                "target.unlink()"
+            ),
+            (
+                "class Cache:\n"
+                "    def unlink(self): pass\n"
+                "    def rmdir(self): pass\n"
+                "cache = Cache()\n"
+                "cache.unlink()\n"
+                "cache.rmdir()"
+            ),
+        ]
+    )
+
+    result = scan_snapshot(snapshot)
+
+    delete_findings = [
+        finding
+        for finding in result["findings"]
+        if finding["category"] == "filesystem_delete"
+    ]
+    assert [finding["cell_index"] for finding in delete_findings] == [0]
+
+
+@pytest.mark.parametrize(
     ("source", "expected_categories"),
     [
         ("!curl https://example.com", {"shell"}),
@@ -261,6 +329,9 @@ def test_explanations_are_redacted_single_line_bounded_and_do_not_echo_source(
         ("missing_source_text", "source.text"),
         ("non_string_source_text", "source.text"),
         ("non_integer_cell_index", "cell index"),
+        ("negative_cell_index", "cell index"),
+        ("duplicate_cell_index", "duplicate cell index"),
+        ("unknown_cell_type", "cell_type"),
     ],
 )
 def test_invalid_snapshot_cell_shape_raises_clear_value_error(
@@ -268,13 +339,19 @@ def test_invalid_snapshot_cell_shape_raises_clear_value_error(
     mutation: str,
     message: str,
 ):
-    snapshot = snapshot_factory(["x = 1"])
+    snapshot = snapshot_factory(["import subprocess"])
     if mutation == "missing_source_text":
         del snapshot["cells"][0]["source"]["text"]
     elif mutation == "non_string_source_text":
         snapshot["cells"][0]["source"]["text"] = 42
-    else:
+    elif mutation == "non_integer_cell_index":
         snapshot["cells"][0]["index"] = "zero"
+    elif mutation == "negative_cell_index":
+        snapshot["cells"][0]["index"] = -1
+    elif mutation == "duplicate_cell_index":
+        snapshot["cells"].append(dict(snapshot["cells"][0]))
+    else:
+        snapshot["cells"][0]["cell_type"] = "unknown"
 
     with pytest.raises(ValueError, match=message):
         scan_snapshot(snapshot)
