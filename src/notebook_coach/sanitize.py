@@ -91,7 +91,7 @@ _SENSITIVE_ASSIGNMENT = re.compile(
             |
             (?P<colon_bare>[^\r\n,]*?[^\s,\r\n])
         )
-        (?P<colon_suffix>[ \t]*)(?=,|\r?$)
+        (?P<colon_suffix>[ \t]*)(?=,|[\x7d\]]|\r?$)
     )
     """,
     re.IGNORECASE | re.MULTILINE | re.VERBOSE,

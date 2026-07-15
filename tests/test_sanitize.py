@@ -91,6 +91,24 @@ def test_redacts_entire_yaml_sensitive_assignment_value():
 
 
 @pytest.mark.parametrize(
+    ("prefix", "suffix"),
+    [
+        ("{", "}"),
+        ("[{", "}]"),
+    ],
+)
+def test_redacts_complete_json_secret_and_preserves_closing_structure(prefix, suffix):
+    secret = "correct,horse,battery,staple"
+    text = f'{prefix}"password": "{secret}"{suffix}'
+
+    cleaned, labels = redact_text(text)
+
+    assert cleaned == f'{prefix}"password": "[REDACTED]"{suffix}'
+    assert secret not in repr((cleaned, labels))
+    assert labels == ["sensitive_assignment"]
+
+
+@pytest.mark.parametrize(
     "target",
     [
         'config["api_key"]',
@@ -155,6 +173,17 @@ def test_summarize_text_redacts_common_assignment_forms_without_crossing_lines()
         word not in result["text"]
         for word in ("correct", "horse", "battery", "staple")
     )
+
+
+def test_summarize_text_redacts_complete_json_secret_without_leaking_fragments():
+    secret = "correct,horse,battery,staple"
+    text = f'{{"password": "{secret}"}}'
+
+    result = summarize_text(text)
+
+    assert result["text"] == '{"password": "[REDACTED]"}'
+    assert secret not in repr(result)
+    assert all(part not in result["text"] for part in secret.split(","))
 
 
 def test_summarize_text_hashes_original_text_stably():
