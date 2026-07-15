@@ -1,0 +1,53 @@
+{
+  "schema_version": "1.0",
+  "run_id": "__RUN_ID__",
+  "notebook_summary": "The notebook demonstrates a small attention-weight calculation.",
+  "concept_map": [
+    "scaled dot-product attention",
+    "softmax normalization"
+  ],
+  "issues": [
+    {
+      "issue_id": "I001",
+      "dimension": "correctness",
+      "severity": "major",
+      "category": "code",
+      "cell_indices": [1],
+      "evidence": "Cell 1 normalizes the score matrix over the query axis.",
+      "impact": "The attention weights do not form one distribution per query.",
+      "recommendation": "Normalize each score row over the key axis."
+    },
+    {
+      "issue_id": "I002",
+      "dimension": "clarity",
+      "severity": "minor",
+      "category": "explanation",
+      "cell_indices": [1],
+      "evidence": "Cell 1 does not explain the selected softmax axis.",
+      "impact": "A reader cannot verify the intended normalization dimension.",
+      "recommendation": "Add one sentence explaining the key axis."
+    }
+  ],
+  "challenges": [
+    {
+      "challenge_id": "C-CODE",
+      "kind": "code",
+      "source_issue_ids": ["I001"],
+      "title": "Repair attention normalization",
+      "prompt": "Complete the TODO so each query row is normalized over keys.",
+      "acceptance_criteria": [
+        "Each query row sums to one"
+      ]
+    },
+    {
+      "challenge_id": "C-CONCEPT",
+      "kind": "concept",
+      "source_issue_ids": ["I001", "I002"],
+      "title": "Explain the normalization axis",
+      "prompt": "Explain why attention normalizes over the key axis.",
+      "acceptance_criteria": [
+        "Mentions one distribution per query"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "schema_version": "1.0",
+  "run_id": "__RUN_ID__",
+  "issue_results": [
+    {
+      "issue_id": "I001",
+      "status": "resolved",
+      "current_cell_indices": [1],
+      "evidence": "Cell 1 now normalizes over the key axis."
+    },
+    {
+      "issue_id": "I002",
+      "status": "remaining",
+      "current_cell_indices": [1],
+      "evidence": "The axis explanation is still missing."
+    }
+  ],
+  "new_issues": [],
+  "challenge_results": [
+    {
+      "challenge_id": "C-CODE",
+      "status": "passed",
+      "evidence": "The code TODO is completed."
+    },
+    {
+      "challenge_id": "C-CONCEPT",
+      "status": "needs_work",
+      "evidence": "The explanation does not yet mention one distribution per query."
+    }
+  ],
+  "next_learning_target": "Relate attention weights to value aggregation."
+}

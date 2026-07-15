@@ -159,3 +159,29 @@ def baseline_factory() -> Callable[..., Path]:
         return run_dir
 
     return make_baseline
+
+
+@pytest.fixture
+def valid_diagnosis() -> dict:
+    fixture_path = Path(__file__).parent / "fixtures/diagnosis-assessment.json"
+    value = json.loads(fixture_path.read_text("utf-8"))
+    value["run_id"] = "20260715T080000Z-aaaaaaaa"
+    return value
+
+
+@pytest.fixture
+def valid_verification() -> dict:
+    fixture_path = Path(__file__).parent / "fixtures/verification-assessment.json"
+    value = json.loads(fixture_path.read_text("utf-8"))
+    value["run_id"] = "20260715T080000Z-aaaaaaaa"
+    return value
+
+
+@pytest.fixture
+def snapshot(snapshot_factory) -> dict:
+    return snapshot_factory(
+        [
+            "import numpy as np\nscores = np.array([[1.0, 2.0]])",
+            "weights = scores.softmax(axis=0)",
+        ]
+    )
