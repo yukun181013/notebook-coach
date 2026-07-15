@@ -9,6 +9,12 @@ from pathlib import Path
 from typing import Any
 
 from notebook_coach.contracts import ContractError
+from notebook_coach.execution import (
+    ExecutionBlockedError,
+    cancel_execution,
+    execute_request,
+    prepare_execution,
+)
 from notebook_coach.notebooks import NotebookInputError
 from notebook_coach.runs import (
     AmbiguousRunError,
@@ -84,6 +90,36 @@ def _handle_validate_run(args: argparse.Namespace) -> dict[str, Any]:
     return {"status": "valid", "run_dir": str(run_dir)}
 
 
+def _handle_prepare_execution(args: argparse.Namespace) -> dict[str, Any]:
+    prepared = prepare_execution(
+        args.run,
+        phase=args.phase,
+        target=args.target,
+        cell_timeout=args.cell_timeout,
+        total_timeout=args.total_timeout,
+    )
+    return {
+        "status": "awaiting_execution_confirmation",
+        "request_path": str(prepared.request_path),
+        "request": prepared.request,
+    }
+
+
+def _handle_execute(args: argparse.Namespace) -> dict[str, Any]:
+    if not args.request or not args.confirmed_target_sha256:
+        raise ExecutionBlockedError(
+            "execution_confirmation_required",
+            "Execution requires a prepared request and confirmed target hash.",
+        )
+    log_path = execute_request(args.request, args.confirmed_target_sha256)
+    return {"status": "executed", "log_path": str(log_path.resolve())}
+
+
+def _handle_cancel_execution(args: argparse.Namespace) -> dict[str, Any]:
+    cancel_execution(args.request)
+    return {"status": "cancelled"}
+
+
 def _handle_not_implemented(_args: argparse.Namespace) -> dict[str, Any]:
     raise WorkflowError(
         "not_implemented", "This command is not available in the static MVP."
@@ -117,11 +153,35 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("run_dir")
     validate.set_defaults(handler=_handle_validate_run)
 
+    prepare_execution_parser = subparsers.add_parser("prepare-execution")
+    prepare_execution_parser.add_argument("--run", required=True)
+    prepare_execution_parser.add_argument(
+        "--phase", required=True, choices=("diagnosis", "verification")
+    )
+    prepare_execution_parser.add_argument(
+        "--target", required=True, choices=("source", "challenge")
+    )
+    prepare_execution_parser.add_argument("--cell-timeout", type=int, default=30)
+    prepare_execution_parser.add_argument("--total-timeout", type=int, default=120)
+    prepare_execution_parser.set_defaults(handler=_handle_prepare_execution)
+
+    execute_parser = subparsers.add_parser("execute")
+    execute_parser.add_argument("--request")
+    execute_parser.add_argument("--confirmed-target-sha256")
+    execute_parser.set_defaults(handler=_handle_execute)
+
+    cancel_parser = subparsers.add_parser("cancel-execution")
+    cancel_parser.add_argument("--request", required=True)
+    cancel_parser.set_defaults(handler=_handle_cancel_execution)
+
     implemented = {
         "prepare-diagnosis",
         "finalize-diagnosis",
         "resolve-run",
         "validate-run",
+        "prepare-execution",
+        "execute",
+        "cancel-execution",
     }
     for command in COMMANDS:
         if command in implemented:
@@ -146,6 +206,11 @@ def main(argv: list[str] | None = None) -> int:
             stream=sys.stderr,
         )
         return 3
+    except ExecutionBlockedError as error:
+        _print_json(
+            {"code": error.code, "message": str(error)}, stream=sys.stderr
+        )
+        return 4
     except (ContractError, WorkflowError, CLIInputError) as error:
         _print_json(
             {"code": error.code, "message": str(error)}, stream=sys.stderr

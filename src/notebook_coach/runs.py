@@ -11,7 +11,7 @@ import shutil
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -424,3 +424,77 @@ class RunStore:
                     raise LedgerTransitionError("Attempt details must be a mapping.")
                 entry["details"] = dict(details)
             _replace_file(ledger_path, _json_bytes(ledger))
+
+    def get_attempt(self, run_dir: Path, attempt_id: str) -> dict[str, Any]:
+        with self._locked_ledger(run_dir) as ledger_path:
+            ledger = self._read_ledger(ledger_path)
+            entry = next(
+                (
+                    item
+                    for item in ledger["entries"]
+                    if isinstance(item, dict)
+                    and item.get("attempt_id") == attempt_id
+                ),
+                None,
+            )
+            if entry is None:
+                raise LedgerTransitionError("Attempt ID does not exist.")
+            return json.loads(json.dumps(entry))
+
+    def recover_stale_attempts(
+        self, run_dir: Path, *, now: datetime | None = None
+    ) -> list[dict[str, Any]]:
+        """Tombstone expired prepared requests and orphaned running workers."""
+
+        current = (now or self._now()).astimezone(timezone.utc)
+        cleanup: list[dict[str, Any]] = []
+        with self._locked_ledger(run_dir) as ledger_path:
+            ledger = self._read_ledger(ledger_path)
+            changed = False
+            for entry in ledger["entries"]:
+                if not isinstance(entry, dict):
+                    continue
+                metadata = entry.get("metadata")
+                if not isinstance(metadata, dict):
+                    continue
+                status = entry.get("status")
+                reason: str | None = None
+                new_status: str | None = None
+                if status == "prepared":
+                    try:
+                        expires_at = datetime.fromisoformat(metadata["expires_at"])
+                        if expires_at.tzinfo is None:
+                            raise ValueError
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if current >= expires_at.astimezone(timezone.utc):
+                        new_status = "expired"
+                        reason = "request_expired"
+                elif status == "running":
+                    try:
+                        started = datetime.fromisoformat(entry["updated_at"])
+                        total_timeout = int(metadata["total_timeout"])
+                        if (
+                            started.tzinfo is None
+                            or isinstance(metadata["total_timeout"], bool)
+                            or total_timeout < 1
+                        ):
+                            raise ValueError
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    deadline = started.astimezone(timezone.utc) + timedelta(
+                        seconds=total_timeout + 60
+                    )
+                    if current >= deadline:
+                        new_status = "failed"
+                        reason = "orphaned_worker"
+                if new_status is None:
+                    continue
+                entry["status"] = new_status
+                entry["updated_at"] = current.isoformat()
+                entry["details"] = {"reason": reason}
+                cleanup.append(dict(metadata))
+                changed = True
+            if changed:
+                _replace_file(ledger_path, _json_bytes(ledger))
+        return cleanup
