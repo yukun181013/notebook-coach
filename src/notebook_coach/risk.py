@@ -234,6 +234,9 @@ class _RiskVisitor(ast.NodeVisitor):
         self.module_aliases: dict[str, str] = {}
         self.imported_names: dict[str, str] = {}
         self.path_scopes: list[tuple[str, dict[str, int]]] = [("module", {})]
+        self.try_exception_state_recorders: list[
+            tuple[int, list[list[tuple[str, dict[str, int]]]]]
+        ] = []
 
     def _resolve_name(self, node: ast.AST) -> str | None:
         name = _qualified_name(node)
@@ -376,6 +379,12 @@ class _RiskVisitor(ast.NodeVisitor):
             self.visit(statement)
         return self._copy_path_state()
 
+    def _record_potential_exception(self) -> None:
+        for scope_count, recorder in self.try_exception_state_recorders:
+            recorder.append(
+                self._copy_path_state(self.path_scopes[:scope_count])
+            )
+
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
             root = _module_root(alias.name)
@@ -500,10 +509,15 @@ class _RiskVisitor(ast.NodeVisitor):
     def _visit_try(self, node: ast.Try | ast.TryStar) -> None:
         base_state = self._copy_path_state()
         self._set_path_state(base_state)
-        exception_states = [self._copy_path_state()]
-        for statement in node.body:
-            self.visit(statement)
-            exception_states.append(self._copy_path_state())
+        exception_states: list[list[tuple[str, dict[str, int]]]] = []
+        self.try_exception_state_recorders.append(
+            (len(self.path_scopes), exception_states)
+        )
+        try:
+            for statement in node.body:
+                self.visit(statement)
+        finally:
+            self.try_exception_state_recorders.pop()
         success_state = self._copy_path_state()
         if node.orelse:
             success_state = self._visit_statements_from(
@@ -511,8 +525,11 @@ class _RiskVisitor(ast.NodeVisitor):
             )
         outcomes = [success_state]
 
-        self._merge_path_states(exception_states)
-        handler_entry_state = self._copy_path_state()
+        if exception_states:
+            self._merge_path_states(exception_states)
+            handler_entry_state = self._copy_path_state()
+        else:
+            handler_entry_state = base_state
 
         for handler in node.handlers:
             self._set_path_state(handler_entry_state)
@@ -564,9 +581,14 @@ class _RiskVisitor(ast.NodeVisitor):
             for name in _function_local_names(node.args, node.body)
         }
         self._push_path_scope("function", local_bindings)
-        for statement in node.body:
-            self.visit(statement)
-        self._pop_path_scope()
+        parent_recorders = self.try_exception_state_recorders
+        self.try_exception_state_recorders = []
+        try:
+            for statement in node.body:
+                self.visit(statement)
+        finally:
+            self.try_exception_state_recorders = parent_recorders
+            self._pop_path_scope()
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._visit_function(node)
@@ -582,13 +604,20 @@ class _RiskVisitor(ast.NodeVisitor):
             name: _PATH_UNKNOWN for name in _argument_names(node.args)
         }
         self._push_path_scope("function", local_bindings)
-        self.visit(node.body)
-        self._pop_path_scope()
+        parent_recorders = self.try_exception_state_recorders
+        self.try_exception_state_recorders = []
+        try:
+            self.visit(node.body)
+        finally:
+            self.try_exception_state_recorders = parent_recorders
+            self._pop_path_scope()
 
     def _visit_comprehension(
         self,
         generators: list[ast.comprehension],
         result_nodes: tuple[ast.AST, ...],
+        *,
+        deferred: bool = False,
     ) -> None:
         if not generators:
             for result_node in result_nodes:
@@ -602,15 +631,21 @@ class _RiskVisitor(ast.NodeVisitor):
             for name in _target_names(generator.target)
         }
         self._push_path_scope("function", local_bindings)
-        for condition in generators[0].ifs:
-            self.visit(condition)
-        for generator in generators[1:]:
-            self.visit(generator.iter)
-            for condition in generator.ifs:
+        parent_recorders = self.try_exception_state_recorders
+        if deferred:
+            self.try_exception_state_recorders = []
+        try:
+            for condition in generators[0].ifs:
                 self.visit(condition)
-        for result_node in result_nodes:
-            self.visit(result_node)
-        self._pop_path_scope()
+            for generator in generators[1:]:
+                self.visit(generator.iter)
+                for condition in generator.ifs:
+                    self.visit(condition)
+            for result_node in result_nodes:
+                self.visit(result_node)
+        finally:
+            self.try_exception_state_recorders = parent_recorders
+            self._pop_path_scope()
 
     def visit_ListComp(self, node: ast.ListComp) -> None:
         self._visit_comprehension(node.generators, (node.elt,))
@@ -622,7 +657,9 @@ class _RiskVisitor(ast.NodeVisitor):
         self._visit_comprehension(node.generators, (node.key, node.value))
 
     def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
-        self._visit_comprehension(node.generators, (node.elt,))
+        self._visit_comprehension(
+            node.generators, (node.elt,), deferred=True
+        )
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         for decorator in node.decorator_list:
@@ -632,13 +669,14 @@ class _RiskVisitor(ast.NodeVisitor):
         for keyword in node.keywords:
             self.visit(keyword.value)
 
-        self._bind_path_name(node.name, _PATH_UNKNOWN)
         self._push_path_scope("class")
         for statement in node.body:
             self.visit(statement)
         self._pop_path_scope()
+        self._bind_path_name(node.name, _PATH_UNKNOWN)
 
     def visit_Call(self, node: ast.Call) -> None:
+        self._record_potential_exception()
         call_name = self._resolve_name(node.func)
 
         if call_name == "os.system":
@@ -671,6 +709,10 @@ class _RiskVisitor(ast.NodeVisitor):
             if path is not None and _looks_like_credential_path(path):
                 self.categories.add("credential_read")
 
+        self.generic_visit(node)
+
+    def visit_Raise(self, node: ast.Raise) -> None:
+        self._record_potential_exception()
         self.generic_visit(node)
 
 

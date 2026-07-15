@@ -302,6 +302,84 @@ def test_try_handler_merges_intermediate_path_states(
     assert result["blocked"] is True
 
 
+def test_try_handler_uses_only_states_before_potential_exceptions(
+    snapshot_factory: SnapshotFactory,
+):
+    source = (
+        "from pathlib import Path\n"
+        "class Fake:\n"
+        "    def unlink(self): pass\n"
+        "fake = Fake()\n"
+        "p = object()\n"
+        "try:\n"
+        "    p = Path('/tmp/x')\n"
+        "    p = fake\n"
+        "    raise RuntimeError('stop')\n"
+        "except RuntimeError:\n"
+        "    p.unlink()"
+    )
+
+    result = scan_snapshot(snapshot_factory([source]))
+
+    assert result == {"blocked": False, "findings": []}
+
+
+def test_try_handler_ignores_exceptions_in_deferred_function_body(
+    snapshot_factory: SnapshotFactory,
+):
+    source = (
+        "from pathlib import Path\n"
+        "p = object()\n"
+        "try:\n"
+        "    def deferred():\n"
+        "        p = Path('/tmp/x')\n"
+        "        might_fail()\n"
+        "except RuntimeError:\n"
+        "    pass\n"
+        "p.unlink()"
+    )
+
+    result = scan_snapshot(snapshot_factory([source]))
+
+    assert result == {"blocked": False, "findings": []}
+
+
+def test_try_handler_records_comprehension_exceptions_at_handler_scope(
+    snapshot_factory: SnapshotFactory,
+):
+    source = (
+        "from pathlib import Path\n"
+        "p = object()\n"
+        "try:\n"
+        "    values = [Path('/tmp/x') for _ in [0]]\n"
+        "except RuntimeError:\n"
+        "    pass\n"
+        "p.unlink()"
+    )
+
+    result = scan_snapshot(snapshot_factory([source]))
+
+    assert result == {"blocked": False, "findings": []}
+
+
+def test_try_handler_preserves_outer_path_binding_when_class_body_raises(
+    snapshot_factory: SnapshotFactory,
+):
+    source = (
+        "from pathlib import Path\n"
+        "try:\n"
+        "    class Path:\n"
+        "        raise RuntimeError('stop')\n"
+        "except RuntimeError:\n"
+        "    Path('/tmp/x').unlink()"
+    )
+
+    result = scan_snapshot(snapshot_factory([source]))
+
+    assert _finding_for(result, "filesystem_delete")["severity"] == "high"
+    assert result["blocked"] is True
+
+
 def test_function_parameters_and_locals_are_scope_isolated(
     snapshot_factory: SnapshotFactory,
 ):
