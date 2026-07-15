@@ -12,6 +12,7 @@ from typing import Any
 import nbformat
 
 from notebook_coach import SCHEMA_VERSION
+from notebook_coach.risk import build_source_risk_metadata
 from notebook_coach.sanitize import redact_text, summarize_text
 
 
@@ -381,10 +382,27 @@ def build_snapshot(
             f"{_CELL_SELECTION_HELP}"
         )
 
+    original_sources: dict[int, str] = {}
+    for index in indexes:
+        original_sources[index] = _notebook_text(notebook.cells[index]["source"])
+
+    code_indexes = [
+        index for index in indexes if notebook.cells[index]["cell_type"] == "code"
+    ]
+    code_risk_metadata = dict(
+        zip(
+            code_indexes,
+            build_source_risk_metadata(
+                original_sources[index] for index in code_indexes
+            ),
+            strict=True,
+        )
+    )
+
     prepared_sources: dict[int, tuple[str, str]] = {}
     total_source_chars = 0
     for index in indexes:
-        source = _notebook_text(notebook.cells[index]["source"])
+        source = original_sources[index]
         cleaned, _ = redact_text(source)
         prepared_sources[index] = (source, cleaned)
         total_source_chars += len(cleaned)
@@ -418,6 +436,7 @@ def build_snapshot(
             "source": safe_source,
         }
         if cell["cell_type"] == "code":
+            safe_cell["risk"] = code_risk_metadata[index]
             safe_cell["execution_count"] = cell.get("execution_count")
             safe_cell["outputs"] = _safe_outputs(cell.get("outputs", ()), state)
         elif cell["cell_type"] == "markdown":

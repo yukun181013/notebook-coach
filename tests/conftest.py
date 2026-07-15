@@ -8,6 +8,7 @@ import pytest
 from nbformat import NotebookNode
 
 from notebook_coach import SCHEMA_VERSION
+from notebook_coach.risk import build_source_risk_metadata
 from notebook_coach.sanitize import redact_text, summarize_text
 
 
@@ -85,8 +86,11 @@ def snapshot_factory() -> Callable[[list[str]], dict]:
         labels: set[str] = set()
         redacted_fields = 0
         cells = []
+        risk_metadata = build_source_risk_metadata(sources)
 
-        for index, source in enumerate(sources):
+        for index, (source, source_risk) in enumerate(
+            zip(sources, risk_metadata, strict=True)
+        ):
             _, source_labels = redact_text(source)
             if source_labels:
                 labels.update(source_labels)
@@ -96,6 +100,7 @@ def snapshot_factory() -> Callable[[list[str]], dict]:
                     "index": index,
                     "cell_type": "code",
                     "source": summarize_text(source, max_chars=150_000),
+                    "risk": source_risk,
                     "execution_count": None,
                     "outputs": [],
                 }

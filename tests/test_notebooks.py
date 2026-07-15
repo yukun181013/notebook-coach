@@ -371,8 +371,13 @@ def test_snapshot_keeps_only_stable_whitelisted_metadata(notebook_factory):
         "index",
         "cell_type",
         "source",
+        "risk",
         "execution_count",
         "outputs",
+    }
+    assert snapshot["cells"][0]["risk"] == {
+        "source_sha256": snapshot["cells"][0]["source"]["sha256"],
+        "categories": [],
     }
     assert set(snapshot["cells"][0]["outputs"][0]) == {"output_type", "data"}
     assert SECRET not in str(snapshot)

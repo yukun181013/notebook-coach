@@ -4,6 +4,7 @@ from collections.abc import Callable
 
 import pytest
 
+from notebook_coach.notebooks import build_snapshot
 from notebook_coach.risk import scan_snapshot
 
 
@@ -17,6 +18,83 @@ def _finding_for(result: dict, category: str) -> dict:
         for finding in result["findings"]
         if finding["category"] == category
     )
+
+
+@pytest.mark.parametrize(
+    ("source", "sensitive_fragment", "category"),
+    [
+        (
+            "import os; secret=os.system('echo notebook-coach-sensitive')",
+            "notebook-coach-sensitive",
+            "shell",
+        ),
+        (
+            "import os; password=os.remove('/tmp/notebook-coach-sensitive')",
+            "/tmp/notebook-coach-sensitive",
+            "filesystem_delete",
+        ),
+        (
+            "from pathlib import Path; "
+            "token=Path('/tmp/notebook-coach-sensitive').unlink()",
+            "/tmp/notebook-coach-sensitive",
+            "filesystem_delete",
+        ),
+        (
+            "api_key=open('.env').read()",
+            ".env",
+            "credential_read",
+        ),
+    ],
+    ids=["shell", "os-remove", "path-unlink", "credential-read"],
+)
+def test_real_snapshot_retains_risk_findings_after_source_redaction(
+    notebook_factory,
+    source: str,
+    sensitive_fragment: str,
+    category: str,
+):
+    path = notebook_factory(code=source)
+
+    snapshot = build_snapshot(path)
+    visible_source = snapshot["cells"][0]["source"]["text"]
+
+    assert "[REDACTED]" in visible_source
+    assert sensitive_fragment not in repr(snapshot)
+
+    result = scan_snapshot(snapshot)
+
+    assert _finding_for(result, category)["severity"] == "high"
+    assert result["blocked"] is True
+
+
+@pytest.mark.parametrize(
+    "risk_metadata",
+    [
+        None,
+        {"source_sha256": "f" * 64, "categories": []},
+        {"source_sha256": "source-hash", "categories": ["unknown"]},
+        {"source_sha256": "source-hash", "categories": "shell"},
+    ],
+    ids=["missing", "hash-mismatch", "unknown-category", "non-list-categories"],
+)
+def test_redacted_source_without_trusted_risk_metadata_fails_closed(
+    snapshot_factory: SnapshotFactory,
+    risk_metadata,
+):
+    snapshot = snapshot_factory(["password = 'synthetic-secret-value'"])
+    source_hash = snapshot["cells"][0]["source"]["sha256"]
+    if risk_metadata is None:
+        snapshot["cells"][0].pop("risk", None)
+    else:
+        snapshot["cells"][0]["risk"] = {
+            key: source_hash if value == "source-hash" else value
+            for key, value in risk_metadata.items()
+        }
+
+    result = scan_snapshot(snapshot)
+
+    assert _finding_for(result, "risk_metadata")["severity"] == "high"
+    assert result["blocked"] is True
 
 
 def test_blocks_shell_network_subprocess_and_delete_calls(

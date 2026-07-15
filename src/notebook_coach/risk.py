@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import operator
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from notebook_coach.sanitize import redact_text, summarize_text
@@ -34,6 +35,7 @@ _SEVERITIES = {
     "filesystem_delete": "high",
     "network": "high",
     "package_install": "high",
+    "risk_metadata": "high",
     "shell": "high",
     "subprocess": "high",
     "syntax_error": "low",
@@ -43,10 +45,15 @@ _EXPLANATIONS = {
     "filesystem_delete": "Cell may delete files or directories.",
     "network": "Cell may access a network resource.",
     "package_install": "Cell may install or change packages.",
+    "risk_metadata": "Cell has redacted source without trusted risk metadata.",
     "shell": "Cell may execute a shell command.",
     "subprocess": "Cell may start a subprocess.",
     "syntax_error": "Cell source could not be parsed as Python.",
 }
+
+_SOURCE_RISK_CATEGORIES = frozenset(_SEVERITIES) - {"risk_metadata"}
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_REDACTED_MARKER = "[REDACTED]"
 
 _PACKAGE_MAGIC = re.compile(
     r"^(?P<prefix>!|%{1,2})\s*(?:pip|conda)\s+install\b",
@@ -981,6 +988,56 @@ def _scan_source(source: str, visitor: _RiskVisitor) -> set[str]:
     return set(visitor.categories)
 
 
+def build_source_risk_metadata(sources: Iterable[str]) -> list[dict[str, Any]]:
+    """Statically scan original sources and return source-free risk metadata."""
+
+    visitor = _RiskVisitor()
+    metadata: list[dict[str, Any]] = []
+    for source in sources:
+        if not isinstance(source, str):
+            raise TypeError("source must be a string")
+        metadata.append(
+            {
+                "source_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+                "categories": sorted(_scan_source(source, visitor)),
+            }
+        )
+    return metadata
+
+
+def _trusted_risk_categories(
+    cell: Mapping[str, Any], source: Mapping[str, Any]
+) -> set[str] | None:
+    metadata = cell.get("risk")
+    if not isinstance(metadata, Mapping) or set(metadata) != {
+        "source_sha256",
+        "categories",
+    }:
+        return None
+
+    source_sha256 = source.get("sha256")
+    metadata_sha256 = metadata.get("source_sha256")
+    if (
+        not isinstance(source_sha256, str)
+        or _SHA256_PATTERN.fullmatch(source_sha256) is None
+        or metadata_sha256 != source_sha256
+    ):
+        return None
+
+    categories = metadata.get("categories")
+    if (
+        not isinstance(categories, list)
+        or any(
+            not isinstance(category, str)
+            or category not in _SOURCE_RISK_CATEGORIES
+            for category in categories
+        )
+        or categories != sorted(set(categories))
+    ):
+        return None
+    return set(categories)
+
+
 def _validated_cells(snapshot: Any) -> list[Mapping[str, Any]]:
     if not isinstance(snapshot, Mapping):
         raise ValueError("snapshot must be a mapping with a cells list.")
@@ -1027,7 +1084,14 @@ def scan_snapshot(snapshot: Any) -> dict[str, Any]:
         if not isinstance(source_text, str):
             raise ValueError("snapshot code cell source.text must be a string.")
 
-        for category in _scan_source(source_text, visitor):
+        categories = _scan_source(source_text, visitor)
+        trusted_categories = _trusted_risk_categories(cell, source)
+        if trusted_categories is not None:
+            categories.update(trusted_categories)
+        elif _REDACTED_MARKER in source_text:
+            categories.add("risk_metadata")
+
+        for category in categories:
             findings.append(_finding(cell_index, category))
 
     unique_findings = {
