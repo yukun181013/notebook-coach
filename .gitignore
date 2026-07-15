@@ -1,4 +1,5 @@
 .worktrees/
+.DS_Store
 .venv/
 .acceptance-venv/
 artifacts/

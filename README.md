@@ -17,7 +17,7 @@ Inspect the complete pre-generated example immediately:
 Requirements: Python 3.11, macOS or Linux, and Codex CLI/Desktop. Native Windows and WSL are currently unverified.
 
 ```bash
-git clone REPOSITORY_URL notebook-coach
+git clone https://github.com/yukun181013/notebook-coach.git notebook-coach
 cd notebook-coach
 bash scripts/install.sh
 ```
