@@ -203,6 +203,8 @@ def validate_verification(
     *,
     run_id: str,
     baseline_issue_ids: list[str],
+    cell_count: int = 1_000_000,
+    challenge_verifiable: bool = True,
 ) -> dict[str, Any]:
     verification = _mapping(
         value,
@@ -233,12 +235,11 @@ def validate_verification(
         if not isinstance(issue_id, str):
             _fail("issue_result_ids", "Issue result ID is invalid.")
         result_ids.append(issue_id)
-        indices = result.get("current_cell_indices")
-        if not isinstance(indices, list) or any(
-            isinstance(index, bool) or not isinstance(index, int) or index < 0
-            for index in indices
-        ):
-            _fail("verification_contract", "Current cell indices are invalid.")
+        _cell_indices(
+            result.get("current_cell_indices"),
+            cell_count=cell_count,
+            allow_empty=True,
+        )
         _text(result.get("evidence"), code="verification_contract")
     if sorted(result_ids) != sorted(baseline_issue_ids) or len(result_ids) != len(
         set(result_ids)
@@ -248,8 +249,21 @@ def validate_verification(
     new_issues = verification.get("new_issues")
     if not isinstance(new_issues, list):
         _fail("verification_contract", "New issues must be a list.")
+    new_issue_ids: list[str] = []
     for issue in new_issues:
-        _validate_issue(issue, cell_count=1_000_000)
+        validated = _validate_issue(issue, cell_count=cell_count)
+        new_issue_ids.append(validated["issue_id"])
+    if set(new_issue_ids).intersection(baseline_issue_ids):
+        _fail("new_issue_ids", "New issue IDs collide with baseline issues.")
+    baseline_numbers = [
+        int(issue_id[1:])
+        for issue_id in baseline_issue_ids
+        if ISSUE_ID_PATTERN.fullmatch(issue_id)
+    ]
+    start = max(baseline_numbers, default=0) + 1
+    expected_new_ids = [f"I{number:03d}" for number in range(start, start + len(new_issues))]
+    if new_issue_ids != expected_new_ids:
+        _fail("new_issue_ids", "New issue IDs must be sequential and unique.")
 
     challenge_results = verification.get("challenge_results")
     if not isinstance(challenge_results, list) or [
@@ -262,6 +276,20 @@ def validate_verification(
         if result.get("status") not in {"passed", "needs_work", "unverifiable"}:
             _fail("verification_contract", "Challenge result status is unsupported.")
         _text(result.get("evidence"), code="verification_contract")
+    challenge_statuses = [result["status"] for result in challenge_results]
+    if challenge_verifiable and "unverifiable" in challenge_statuses:
+        _fail(
+            "challenge_verifiability",
+            "Unverifiable challenge status requires a metadata mismatch.",
+        )
+    if not challenge_verifiable and challenge_statuses != [
+        "unverifiable",
+        "unverifiable",
+    ]:
+        _fail(
+            "challenge_verifiability",
+            "Both challenge results must remain unverifiable in this cycle.",
+        )
     _text(
         verification.get("next_learning_target"), code="verification_contract"
     )

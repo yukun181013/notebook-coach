@@ -24,9 +24,12 @@ from notebook_coach.runs import (
     SourceMismatchError,
 )
 from notebook_coach.workflows import (
+    ConfirmationRequiredError,
     WorkflowError,
     finalize_diagnosis,
+    finalize_verification,
     prepare_diagnosis,
+    prepare_verification,
     validate_run,
 )
 
@@ -120,6 +123,33 @@ def _handle_cancel_execution(args: argparse.Namespace) -> dict[str, Any]:
     return {"status": "cancelled"}
 
 
+def _handle_prepare_verification(args: argparse.Namespace) -> dict[str, Any]:
+    prepared = prepare_verification(
+        args.source,
+        args.run,
+        confirm_source_mismatch=args.confirm_source_mismatch,
+        confirm_environment_mismatch=args.confirm_environment_mismatch,
+    )
+    return {
+        "status": "awaiting_model_assessment",
+        "run_id": prepared.run_id,
+        "stage": str(prepared.stage_dir),
+        "assessment_path": str(prepared.assessment_path),
+        "source_snapshot_path": str(prepared.source_snapshot_path),
+        "challenge_snapshot_path": str(prepared.challenge_snapshot_path),
+        "challenge_verifiability": prepared.challenge_verifiability,
+    }
+
+
+def _handle_finalize_verification(args: argparse.Namespace) -> dict[str, Any]:
+    result = finalize_verification(args.stage)
+    return {
+        "status": "finalized",
+        "verification_report": str(result.report_path.resolve()),
+        "verification_state": str(result.state_path.resolve()),
+    }
+
+
 def _handle_not_implemented(_args: argparse.Namespace) -> dict[str, Any]:
     raise WorkflowError(
         "not_implemented", "This command is not available in the static MVP."
@@ -174,6 +204,21 @@ def build_parser() -> argparse.ArgumentParser:
     cancel_parser.add_argument("--request", required=True)
     cancel_parser.set_defaults(handler=_handle_cancel_execution)
 
+    prepare_verification_parser = subparsers.add_parser("prepare-verification")
+    prepare_verification_parser.add_argument("source")
+    prepare_verification_parser.add_argument("--run", required=True)
+    prepare_verification_parser.add_argument(
+        "--confirm-source-mismatch", action="store_true"
+    )
+    prepare_verification_parser.add_argument(
+        "--confirm-environment-mismatch", action="store_true"
+    )
+    prepare_verification_parser.set_defaults(handler=_handle_prepare_verification)
+
+    finalize_verification_parser = subparsers.add_parser("finalize-verification")
+    finalize_verification_parser.add_argument("--stage", required=True)
+    finalize_verification_parser.set_defaults(handler=_handle_finalize_verification)
+
     implemented = {
         "prepare-diagnosis",
         "finalize-diagnosis",
@@ -182,6 +227,8 @@ def build_parser() -> argparse.ArgumentParser:
         "prepare-execution",
         "execute",
         "cancel-execution",
+        "prepare-verification",
+        "finalize-verification",
     }
     for command in COMMANDS:
         if command in implemented:
@@ -211,6 +258,12 @@ def main(argv: list[str] | None = None) -> int:
             {"code": error.code, "message": str(error)}, stream=sys.stderr
         )
         return 4
+    except ConfirmationRequiredError as error:
+        _print_json(
+            {"code": error.code, "message": str(error), **error.details},
+            stream=sys.stderr,
+        )
+        return 2
     except (ContractError, WorkflowError, CLIInputError) as error:
         _print_json(
             {"code": error.code, "message": str(error)}, stream=sys.stderr

@@ -190,3 +190,81 @@ def build_challenge_notebook(assessment: dict[str, Any]):
         },
     }
     return notebook
+
+
+def render_verification(state: dict[str, Any]) -> str:
+    assessment = state["assessment"]
+    lines = [
+        "# Notebook Coach Verification",
+        "",
+        f"Run ID: `{state['run_id']}`  ",
+        f"Revision: {state['revision']}",
+        "",
+        "## Source notebook changes",
+        "",
+    ]
+    status_titles = {
+        "resolved": "Resolved",
+        "remaining": "Remaining",
+        "regressed": "Regressed",
+    }
+    for status in ("resolved", "remaining", "regressed"):
+        lines.extend([f"### {status_titles[status]} issues", ""])
+        matching = [
+            item for item in assessment["issue_results"] if item["status"] == status
+        ]
+        if not matching:
+            lines.append("None.")
+        for result in matching:
+            cells = _cell_label(result["current_cell_indices"])
+            label = f" ({cells})" if cells else ""
+            lines.append(f"- {result['issue_id']}{label}: {result['evidence']}")
+        lines.append("")
+
+    lines.extend(["### New issues", ""])
+    if not assessment["new_issues"]:
+        lines.append("None.")
+    for issue in assessment["new_issues"]:
+        lines.append(
+            f"- {issue['issue_id']} ({issue['severity']}, {issue['dimension']}): "
+            f"{issue['evidence']}"
+        )
+    lines.extend(["", "### Learning Evidence Score", ""])
+    before = state["before_score"]
+    after = state["after_score"]
+    for dimension in WEIGHTS:
+        lines.append(
+            f"- {dimension}: {before['dimensions'][dimension]} → "
+            f"{after['dimensions'][dimension]}"
+        )
+    lines.extend(
+        [
+            f"- Total: **{before['total']} → {after['total']} / 100**",
+            "",
+            "## Challenge results",
+            "",
+        ]
+    )
+    for result in assessment["challenge_results"]:
+        lines.append(
+            f"- {result['challenge_id']}: **{result['status']}** — {result['evidence']}"
+        )
+    lines.extend(
+        [
+            "",
+            "## Next learning target",
+            "",
+            assessment["next_learning_target"],
+            "",
+            "## Optional execution results and limits",
+            "",
+        ]
+    )
+    reviews = state.get("execution_reviews", [])
+    if reviews:
+        lines.extend(f"- {review['summary']}" for review in reviews)
+    else:
+        lines.append(
+            "No notebook code was executed for this verification revision."
+        )
+    return "\n".join(lines).rstrip() + "\n"
