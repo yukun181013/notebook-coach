@@ -38,31 +38,25 @@ def _cell_result(index: int, cell: Any) -> dict[str, Any]:
     }
 
 
-def _timeout_cell_index(notebook: Any) -> int | None:
-    executed = [
-        index
-        for index, cell in enumerate(notebook.cells)
-        if cell.cell_type == "code" and cell.get("execution_count") is not None
-    ]
-    if executed:
-        return executed[-1]
-    return next(
-        (
-            index
-            for index, cell in enumerate(notebook.cells)
-            if cell.cell_type == "code"
-        ),
-        None,
-    )
-
-
 def run(input_path: Path, output_path: Path, kernel: str, cell_timeout: int) -> None:
     notebook = nbformat.read(input_path, as_version=4)
+    for cell in notebook.cells:
+        if cell.cell_type == "code":
+            cell["execution_count"] = None
+            cell["outputs"] = []
+    active_cell_index: int | None = None
+
+    def record_cell_start(*, cell: Any, cell_index: int) -> None:
+        nonlocal active_cell_index
+        if cell.cell_type == "code":
+            active_cell_index = cell_index
+
     client = NotebookClient(
         notebook,
         timeout=cell_timeout,
         allow_errors=True,
         kernel_name=kernel,
+        on_cell_start=record_cell_start,
     )
     timed_out = False
     timeout_summary: str | None = None
@@ -72,7 +66,7 @@ def run(input_path: Path, output_path: Path, kernel: str, cell_timeout: int) -> 
     except CellTimeoutError as error:
         timed_out = True
         timeout_summary = str(error)
-        timeout_cell_index = _timeout_cell_index(notebook)
+        timeout_cell_index = active_cell_index
     cells = [
         _cell_result(index, cell)
         for index, cell in enumerate(notebook.cells)
@@ -82,7 +76,8 @@ def run(input_path: Path, output_path: Path, kernel: str, cell_timeout: int) -> 
         for cell in cells:
             if cell["cell_index"] == timeout_cell_index:
                 cell["status"] = "timeout"
-                break
+            elif notebook.cells[cell["cell_index"]].get("execution_count") is None:
+                cell["status"] = "not_run"
     result = {
         "cells": cells,
         "has_cell_errors": any(cell["status"] == "error" for cell in cells),

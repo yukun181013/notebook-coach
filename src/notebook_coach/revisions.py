@@ -198,6 +198,59 @@ def _assessment_id(state: dict[str, Any]) -> str:
     return hashlib.sha256(_json_bytes(identity).rstrip(b"\n")).hexdigest()
 
 
+def _verification_source_cell_count(
+    state: dict[str, Any], baseline: dict[str, Any]
+) -> int:
+    source_target = state.get("source_target")
+    baseline_source = baseline.get("source")
+    if not isinstance(source_target, dict) or not isinstance(baseline_source, dict):
+        raise RevisionError(
+            "verification_state_invalid", "Verification source target is invalid."
+        )
+    cell_count = source_target.get("cell_count")
+    if (
+        not isinstance(cell_count, bool)
+        and isinstance(cell_count, int)
+        and cell_count >= 0
+    ):
+        return cell_count
+
+    if (
+        source_target.get("path") == baseline_source.get("path")
+        and source_target.get("sha256") == baseline_source.get("sha256")
+    ):
+        cell_count = baseline_source.get("cell_count")
+        if (
+            not isinstance(cell_count, bool)
+            and isinstance(cell_count, int)
+            and cell_count >= 0
+        ):
+            return cell_count
+
+    path_value = source_target.get("path")
+    expected_hash = source_target.get("sha256")
+    if not isinstance(path_value, str) or not isinstance(expected_hash, str):
+        raise RevisionError(
+            "verification_state_invalid",
+            "Legacy verification source metadata is invalid.",
+        )
+    try:
+        body = Path(path_value).read_bytes()
+        notebook = json.loads(body)
+        cells = notebook["cells"]
+    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError):
+        raise RevisionError(
+            "verification_state_invalid",
+            "Legacy verification source metadata is invalid.",
+        ) from None
+    if hashlib.sha256(body).hexdigest() != expected_hash or not isinstance(cells, list):
+        raise RevisionError(
+            "verification_state_invalid",
+            "Legacy verification source metadata is invalid.",
+        )
+    return len(cells)
+
+
 def _replace_pair(
     state_path: Path, state_body: bytes, report_path: Path, report_body: bytes
 ) -> None:
@@ -276,16 +329,7 @@ def apply_execution_review(
         report_path = directory / "verification.md"
         target_state = state.get(f"{target}_target", {})
         analysis_id = state.get("assessment_id")
-        cell_count = state.get("source_target", {}).get("cell_count")
-        if (
-            isinstance(cell_count, bool)
-            or not isinstance(cell_count, int)
-            or cell_count < 0
-        ):
-            raise RevisionError(
-                "verification_state_invalid",
-                "Verification source cell count is invalid.",
-            )
+        cell_count = _verification_source_cell_count(state, baseline)
     else:
         state_path = directory / ".notebook-coach/report-state.json"
         state = _read_object(state_path, code="report_state_invalid", label="Report state")
@@ -333,6 +377,8 @@ def apply_execution_review(
     )
 
     updated = copy.deepcopy(state)
+    if phase == "verification":
+        updated["source_target"]["cell_count"] = cell_count
     updated["revision"] = int(updated.get("revision", 0)) + 1
     updated["execution_reviews"].append(review)
     if phase == "diagnosis":

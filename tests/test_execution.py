@@ -320,10 +320,18 @@ def test_total_timeout_terminates_worker_and_cleans_temp_under_five_seconds(
 def test_cell_timeout_is_eligible_and_preserves_completed_cell_evidence(
     notebook_factory, tmp_path: Path, valid_diagnosis: dict
 ):
+    stale_cell = nbformat.v4.new_code_cell("print('fresh-third')")
+    stale_cell.execution_count = 7
+    stale_cell.outputs = [
+        nbformat.v4.new_output(
+            output_type="stream", name="stdout", text="stale-third\n"
+        )
+    ]
     source = notebook_factory(
         cells=[
             nbformat.v4.new_code_cell("print('completed-step')"),
             nbformat.v4.new_code_cell("while True:\n    pass"),
+            stale_cell,
         ]
     )
     run_dir = _finalized_run(source, tmp_path / "runs", valid_diagnosis)
@@ -345,6 +353,13 @@ def test_cell_timeout_is_eligible_and_preserves_completed_cell_evidence(
     assert log["worker"]["timed_out"] is True
     assert log["worker"]["timeout_cell_index"] == 1
     assert "completed-step" in log_path.read_text("utf-8")
+    assert "stale-third" not in log_path.read_text("utf-8")
+    assert [cell["status"]["text"] for cell in log["worker"]["cells"]] == [
+        "completed",
+        "timeout",
+        "not_run",
+    ]
+    assert log["worker"]["cells"][2]["stdout"]["text"] == ""
 
 
 def test_execution_log_redacts_and_bounds_notebook_output(

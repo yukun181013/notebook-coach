@@ -298,6 +298,47 @@ def test_verification_review_rejects_new_issue_outside_source_cells(
     assert error.value.code == "unknown_cell_index"
 
 
+def test_verification_review_accepts_legacy_state_without_source_cell_count(
+    notebook_path: Path,
+    tmp_path: Path,
+    valid_diagnosis: dict,
+    valid_verification: dict,
+):
+    run_dir = _run(notebook_path, tmp_path / "runs", valid_diagnosis)
+    _verification(
+        run_dir, notebook_path, valid_verification, statuses=("remaining", "remaining")
+    )
+    state_path = run_dir / ".notebook-coach/verification-state.json"
+    state = json.loads(state_path.read_text("utf-8"))
+    state["source_target"].pop("cell_count")
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    log_path = _write_log(
+        run_dir, phase="verification", target="source", attempt_id="A001"
+    )
+    review_path = _write_review(
+        tmp_path / "legacy-review.json",
+        run_id=state["run_id"],
+        phase="verification",
+        target="source",
+        attempt_id="A001",
+        execution_log=log_path.name,
+        issue_updates=[
+            {
+                "issue_id": "I001",
+                "status": "resolved",
+                "evidence_label": "supported",
+                "evidence": "Legacy verification state remains reviewable.",
+            }
+        ],
+    )
+
+    result = apply_execution_review(run_dir, log_path, review_path)
+
+    assert result.revision == 2
+    migrated = json.loads(state_path.read_text("utf-8"))
+    assert migrated["source_target"]["cell_count"] == 2
+
+
 def test_unverifiable_challenge_rejects_review_before_reading_log(
     notebook_path: Path,
     tmp_path: Path,
