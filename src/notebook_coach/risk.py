@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import operator
 import re
 from collections.abc import Mapping
 from typing import Any
@@ -169,6 +170,182 @@ _POTENTIAL_EXCEPTION_NODE_TYPES = (
     ast.YieldFrom,
 )
 
+_MAX_CONSTANT_DEPTH = 8
+_MAX_CONSTANT_ITEMS = 32
+_MAX_CONSTANT_TEXT = 1_024
+_MAX_CONSTANT_INT_BITS = 64
+_UNPROVEN_CONSTANT = object()
+
+_CONSTANT_NUMBER_TYPES = {bool, int, float, complex}
+_CONSTANT_BINARY_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.BitOr: operator.or_,
+    ast.BitXor: operator.xor,
+    ast.BitAnd: operator.and_,
+}
+_CONSTANT_COMPARISON_OPERATORS = {
+    ast.Eq: operator.eq,
+    ast.NotEq: operator.ne,
+    ast.Lt: operator.lt,
+    ast.LtE: operator.le,
+    ast.Gt: operator.gt,
+    ast.GtE: operator.ge,
+    ast.In: lambda left, right: operator.contains(right, left),
+    ast.NotIn: lambda left, right: not operator.contains(right, left),
+}
+_CONSTANT_UNARY_OPERATORS = {
+    ast.Not: operator.not_,
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+    ast.Invert: operator.invert,
+}
+
+
+def _is_bounded_constant_value(value: Any, *, depth: int = 0) -> bool:
+    if depth > _MAX_CONSTANT_DEPTH:
+        return False
+    if value is None or value is Ellipsis or type(value) in {bool, float, complex}:
+        return True
+    if type(value) is int:
+        return value.bit_length() <= _MAX_CONSTANT_INT_BITS
+    if type(value) in {str, bytes}:
+        return len(value) <= _MAX_CONSTANT_TEXT
+    if type(value) in {list, tuple}:
+        return len(value) <= _MAX_CONSTANT_ITEMS and all(
+            _is_bounded_constant_value(item, depth=depth + 1)
+            for item in value
+        )
+    return False
+
+
+def _bounded_operation(operation: Any, *values: Any) -> Any:
+    try:
+        result = operation(*values)
+    except (ArithmeticError, LookupError, TypeError, ValueError):
+        return _UNPROVEN_CONSTANT
+    return result if _is_bounded_constant_value(result) else _UNPROVEN_CONSTANT
+
+
+def _bounded_constant_value(node: ast.AST, *, depth: int = 0) -> Any:
+    if depth > _MAX_CONSTANT_DEPTH:
+        return _UNPROVEN_CONSTANT
+    if isinstance(node, ast.Constant):
+        return (
+            node.value
+            if _is_bounded_constant_value(node.value, depth=depth)
+            else _UNPROVEN_CONSTANT
+        )
+    if isinstance(node, (ast.List, ast.Tuple)):
+        if len(node.elts) > _MAX_CONSTANT_ITEMS:
+            return _UNPROVEN_CONSTANT
+        values = [
+            _bounded_constant_value(element, depth=depth + 1)
+            for element in node.elts
+        ]
+        if any(value is _UNPROVEN_CONSTANT for value in values):
+            return _UNPROVEN_CONSTANT
+        return values if isinstance(node, ast.List) else tuple(values)
+    if isinstance(node, ast.UnaryOp):
+        operand = _bounded_constant_value(node.operand, depth=depth + 1)
+        if operand is _UNPROVEN_CONSTANT:
+            return _UNPROVEN_CONSTANT
+        operation = _CONSTANT_UNARY_OPERATORS.get(type(node.op))
+        if operation is None or (
+            not isinstance(node.op, ast.Not)
+            and type(operand) not in _CONSTANT_NUMBER_TYPES
+        ):
+            return _UNPROVEN_CONSTANT
+        return _bounded_operation(operation, operand)
+    if isinstance(node, ast.BinOp):
+        left = _bounded_constant_value(node.left, depth=depth + 1)
+        right = _bounded_constant_value(node.right, depth=depth + 1)
+        if left is _UNPROVEN_CONSTANT or right is _UNPROVEN_CONSTANT:
+            return _UNPROVEN_CONSTANT
+        operation = _CONSTANT_BINARY_OPERATORS.get(type(node.op))
+        if operation is None or (
+            type(left) not in _CONSTANT_NUMBER_TYPES
+            or type(right) not in _CONSTANT_NUMBER_TYPES
+        ):
+            return _UNPROVEN_CONSTANT
+        return _bounded_operation(operation, left, right)
+    if isinstance(node, ast.BoolOp):
+        value: Any = _UNPROVEN_CONSTANT
+        for expression in node.values:
+            if value is not _UNPROVEN_CONSTANT:
+                if isinstance(node.op, ast.And) and not value:
+                    return value
+                if isinstance(node.op, ast.Or) and value:
+                    return value
+            value = _bounded_constant_value(expression, depth=depth + 1)
+            if value is _UNPROVEN_CONSTANT:
+                return _UNPROVEN_CONSTANT
+        return value
+    if isinstance(node, ast.Compare):
+        left = _bounded_constant_value(node.left, depth=depth + 1)
+        if left is _UNPROVEN_CONSTANT:
+            return _UNPROVEN_CONSTANT
+        for comparison, comparator in zip(
+            node.ops, node.comparators, strict=True
+        ):
+            right = _bounded_constant_value(comparator, depth=depth + 1)
+            if right is _UNPROVEN_CONSTANT:
+                return _UNPROVEN_CONSTANT
+            operation = _CONSTANT_COMPARISON_OPERATORS.get(type(comparison))
+            if operation is None:
+                return _UNPROVEN_CONSTANT
+            compared = _bounded_operation(operation, left, right)
+            if compared is _UNPROVEN_CONSTANT:
+                return _UNPROVEN_CONSTANT
+            if not compared:
+                return False
+            left = right
+        return True
+    if isinstance(node, ast.IfExp):
+        test = _bounded_constant_value(node.test, depth=depth + 1)
+        if test is _UNPROVEN_CONSTANT:
+            return _UNPROVEN_CONSTANT
+        branch = node.body if test else node.orelse
+        return _bounded_constant_value(branch, depth=depth + 1)
+    if isinstance(node, ast.Subscript):
+        value = _bounded_constant_value(node.value, depth=depth + 1)
+        index = _bounded_constant_value(node.slice, depth=depth + 1)
+        if value is _UNPROVEN_CONSTANT or index is _UNPROVEN_CONSTANT:
+            return _UNPROVEN_CONSTANT
+        return _bounded_operation(operator.getitem, value, index)
+    return _UNPROVEN_CONSTANT
+
+
+def _potential_exception_is_proven_safe(node: ast.AST) -> bool:
+    if isinstance(node, ast.Assert):
+        value = _bounded_constant_value(node.test)
+        return value is not _UNPROVEN_CONSTANT and bool(value)
+    if isinstance(node, ast.GeneratorExp) and node.generators:
+        iterable = _bounded_constant_value(node.generators[0].iter)
+        return iterable is not _UNPROVEN_CONSTANT and type(iterable) in {
+            str,
+            bytes,
+            list,
+            tuple,
+        }
+    if isinstance(
+        node,
+        (
+            ast.BinOp,
+            ast.BoolOp,
+            ast.Compare,
+            ast.IfExp,
+            ast.Subscript,
+            ast.UnaryOp,
+        ),
+    ):
+        return _bounded_constant_value(node) is not _UNPROVEN_CONSTANT
+    return False
+
 
 class _FunctionBindingCollector(ast.NodeVisitor):
     def __init__(self) -> None:
@@ -271,7 +448,9 @@ class _RiskVisitor(ast.NodeVisitor):
         ] = []
 
     def visit(self, node: ast.AST) -> Any:
-        if isinstance(node, _POTENTIAL_EXCEPTION_NODE_TYPES):
+        if isinstance(
+            node, _POTENTIAL_EXCEPTION_NODE_TYPES
+        ) and not _potential_exception_is_proven_safe(node):
             self._record_potential_exception()
         return super().visit(node)
 

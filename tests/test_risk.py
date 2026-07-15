@@ -303,29 +303,78 @@ def test_try_handler_merges_intermediate_path_states(
 
 
 @pytest.mark.parametrize(
-    "operation",
-    ["1 / 0", "assert False", "[][0]"],
-    ids=["binary-operation", "assertion", "subscription"],
+    ("operation", "blocked"),
+    [
+        ("1 + 2", False),
+        ("1 / 0", True),
+        ("assert True", False),
+        ("assert False", True),
+        ("[1][0]", False),
+        ("[][0]", True),
+    ],
+    ids=[
+        "safe-binary-operation",
+        "raising-binary-operation",
+        "safe-assertion",
+        "raising-assertion",
+        "safe-subscription",
+        "raising-subscription",
+    ],
 )
-def test_try_handler_records_implicit_exception_states(
+def test_try_handler_classifies_constant_expression_exception_states(
     snapshot_factory: SnapshotFactory,
     operation: str,
+    blocked: bool,
 ):
     source = (
         "from pathlib import Path\n"
+        "class Fake:\n"
+        "    def unlink(self): pass\n"
+        "fake = Fake()\n"
+        "p = object()\n"
         "try:\n"
         "    p = Path('/tmp/x')\n"
         f"    {operation}\n"
-        "    p = None\n"
+        "    p = fake\n"
+        "    raise RuntimeError('stop')\n"
         "except Exception:\n"
-        "    pass\n"
-        "p.unlink()"
+        "    p.unlink()"
     )
 
     result = scan_snapshot(snapshot_factory([source]))
 
-    assert _finding_for(result, "filesystem_delete")["severity"] == "high"
-    assert result["blocked"] is True
+    delete_findings = [
+        finding
+        for finding in result["findings"]
+        if finding["category"] == "filesystem_delete"
+    ]
+    assert bool(delete_findings) is blocked
+    assert result["blocked"] is blocked
+    if blocked:
+        assert delete_findings[0]["severity"] == "high"
+
+
+def test_try_handler_ignores_uniterated_safe_literal_generator_creation(
+    snapshot_factory: SnapshotFactory,
+):
+    source = (
+        "from pathlib import Path\n"
+        "class Fake:\n"
+        "    def unlink(self): pass\n"
+        "fake = Fake()\n"
+        "p = object()\n"
+        "try:\n"
+        "    p = Path('/tmp/x')\n"
+        "    generator = (1 / 0 for _ in (1, 2))\n"
+        "    p = fake\n"
+        "    raise RuntimeError('stop')\n"
+        "except RuntimeError:\n"
+        "    p.unlink()"
+    )
+
+    result = scan_snapshot(snapshot_factory([source]))
+
+    assert result == {"blocked": False, "findings": []}
 
 
 def test_try_handler_uses_only_states_before_potential_exceptions(
