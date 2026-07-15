@@ -160,6 +160,46 @@ def test_path_instance_alias_propagates_to_delete_calls(
     assert result["blocked"] is True
 
 
+@pytest.mark.parametrize(
+    ("sources", "expected_cell_index"),
+    [
+        (
+            [
+                "from pathlib import Path",
+                "Path('/tmp/x').unlink()",
+            ],
+            1,
+        ),
+        (
+            [
+                "from pathlib import Path",
+                "p = Path('/tmp/x')",
+                "p.rmdir()",
+            ],
+            2,
+        ),
+        (
+            [
+                "import os as x",
+                "x.remove('/tmp/x')",
+            ],
+            1,
+        ),
+    ],
+)
+def test_ast_symbols_persist_across_code_cells(
+    snapshot_factory: SnapshotFactory,
+    sources: list[str],
+    expected_cell_index: int,
+):
+    result = scan_snapshot(snapshot_factory(sources))
+
+    finding = _finding_for(result, "filesystem_delete")
+    assert finding["cell_index"] == expected_cell_index
+    assert finding["severity"] == "high"
+    assert result["blocked"] is True
+
+
 def test_nested_function_rebinding_does_not_clear_outer_path_binding(
     snapshot_factory: SnapshotFactory,
 ):
@@ -175,6 +215,66 @@ def test_nested_function_rebinding_does_not_clear_outer_path_binding(
 
     assert _finding_for(result, "filesystem_delete")["severity"] == "high"
     assert result["blocked"] is True
+
+
+def test_control_flow_merges_path_bindings_conservatively(
+    snapshot_factory: SnapshotFactory,
+):
+    snapshot = snapshot_factory(
+        [
+            (
+                "from pathlib import Path\n"
+                "p = Path('/tmp/x')\n"
+                "if False:\n"
+                "    p = object()\n"
+                "p.unlink()"
+            ),
+            (
+                "from pathlib import Path\n"
+                "p = Path('/tmp/x')\n"
+                "if condition:\n"
+                "    p = object()\n"
+                "else:\n"
+                "    pass\n"
+                "p.rmdir()"
+            ),
+            (
+                "from pathlib import Path\n"
+                "p = Path('/tmp/x')\n"
+                "while condition:\n"
+                "    p = object()\n"
+                "p.unlink()"
+            ),
+            (
+                "from pathlib import Path\n"
+                "p = Path('/tmp/x')\n"
+                "try:\n"
+                "    might_fail()\n"
+                "    p = object()\n"
+                "except Exception:\n"
+                "    pass\n"
+                "p.rmdir()"
+            ),
+            (
+                "from pathlib import Path\n"
+                "p = Path('/tmp/x')\n"
+                "if condition:\n"
+                "    p = object()\n"
+                "else:\n"
+                "    p = object()\n"
+                "p.unlink()"
+            ),
+        ]
+    )
+
+    result = scan_snapshot(snapshot)
+
+    delete_findings = [
+        finding
+        for finding in result["findings"]
+        if finding["category"] == "filesystem_delete"
+    ]
+    assert [finding["cell_index"] for finding in delete_findings] == [0, 1, 2, 3]
 
 
 def test_function_parameters_and_locals_are_scope_isolated(
@@ -211,6 +311,92 @@ def test_function_parameters_and_locals_are_scope_isolated(
         if finding["category"] == "filesystem_delete"
     ]
     assert [finding["cell_index"] for finding in delete_findings] == [0]
+
+
+def test_comprehension_targets_use_an_isolated_scope(
+    snapshot_factory: SnapshotFactory,
+):
+    snapshot = snapshot_factory(
+        [
+            (
+                "from pathlib import Path\n"
+                "class Fake: pass\n"
+                "def cleanup():\n"
+                "    [None for Path in [Fake]]\n"
+                "    Path('/tmp/x').unlink()"
+            ),
+            (
+                "from pathlib import Path\n"
+                "class Fake:\n"
+                "    def unlink(self): pass\n"
+                "[Path().unlink() for Path in [Fake]]"
+            ),
+            (
+                "from pathlib import Path\n"
+                "class Fake: pass\n"
+                "[None for Path in [Fake]]\n"
+                "Path('/tmp/x').rmdir()"
+            ),
+        ]
+    )
+
+    result = scan_snapshot(snapshot)
+
+    delete_findings = [
+        finding
+        for finding in result["findings"]
+        if finding["category"] == "filesystem_delete"
+    ]
+    assert [finding["cell_index"] for finding in delete_findings] == [0, 2]
+
+
+def test_block_binding_targets_shadow_path_identity(
+    snapshot_factory: SnapshotFactory,
+):
+    snapshot = snapshot_factory(
+        [
+            (
+                "from pathlib import Path\n"
+                "class Fake:\n"
+                "    def unlink(self): pass\n"
+                "for Path in [Fake]:\n"
+                "    Path().unlink()"
+            ),
+            (
+                "from pathlib import Path\n"
+                "class Fake:\n"
+                "    def rmdir(self): pass\n"
+                "with manager() as Path:\n"
+                "    Path().rmdir()"
+            ),
+            (
+                "from pathlib import Path\n"
+                "class Fake:\n"
+                "    def unlink(self): pass\n"
+                "try:\n"
+                "    risky()\n"
+                "except Exception as Path:\n"
+                "    Path().unlink()"
+            ),
+            (
+                "from pathlib import Path\n"
+                "class Fake:\n"
+                "    def unlink(self): pass\n"
+                "for Path in [Fake]:\n"
+                "    Path().unlink()\n"
+                "Path('/tmp/x').unlink()"
+            ),
+        ]
+    )
+
+    result = scan_snapshot(snapshot)
+
+    delete_findings = [
+        finding
+        for finding in result["findings"]
+        if finding["category"] == "filesystem_delete"
+    ]
+    assert [finding["cell_index"] for finding in delete_findings] == [3]
 
 
 @pytest.mark.parametrize(

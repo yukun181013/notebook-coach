@@ -132,10 +132,10 @@ def _literal_path(node: ast.AST) -> str | None:
     return None
 
 
-_PATH_UNKNOWN = "unknown"
-_PATH_MODULE = "module"
-_PATH_CONSTRUCTOR = "constructor"
-_PATH_INSTANCE = "instance"
+_PATH_UNKNOWN = 0
+_PATH_MODULE = 1 << 0
+_PATH_CONSTRUCTOR = 1 << 1
+_PATH_INSTANCE = 1 << 2
 
 
 class _FunctionBindingCollector(ast.NodeVisitor):
@@ -167,6 +167,18 @@ class _FunctionBindingCollector(ast.NodeVisitor):
         self.names.add(node.name)
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
+        return
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        return
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        return
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        return
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
         return
 
     def visit_Global(self, node: ast.Global) -> None:
@@ -203,12 +215,25 @@ def _function_local_names(
     ) - collector.global_names - collector.nonlocal_names
 
 
+def _target_names(target: ast.AST) -> set[str]:
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, ast.Starred):
+        return _target_names(target.value)
+    if isinstance(target, (ast.List, ast.Tuple)):
+        names: set[str] = set()
+        for element in target.elts:
+            names.update(_target_names(element))
+        return names
+    return set()
+
+
 class _RiskVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         self.categories: set[str] = set()
         self.module_aliases: dict[str, str] = {}
         self.imported_names: dict[str, str] = {}
-        self.path_scopes: list[tuple[str, dict[str, str]]] = [("module", {})]
+        self.path_scopes: list[tuple[str, dict[str, int]]] = [("module", {})]
 
     def _resolve_name(self, node: ast.AST) -> str | None:
         name = _qualified_name(node)
@@ -226,7 +251,7 @@ class _RiskVisitor(ast.NodeVisitor):
             return module + (separator + remainder if separator else "")
         return name
 
-    def _lookup_path_name(self, name: str) -> str:
+    def _lookup_path_name(self, name: str) -> int:
         skip_class_scopes = self.path_scopes[-1][0] == "function"
         for scope_kind, bindings in reversed(self.path_scopes):
             if skip_class_scopes and scope_kind == "class":
@@ -235,18 +260,18 @@ class _RiskVisitor(ast.NodeVisitor):
                 return bindings[name]
         return _PATH_UNKNOWN
 
-    def _path_identity(self, node: ast.AST) -> str:
+    def _path_identity(self, node: ast.AST) -> int:
         if isinstance(node, ast.Name):
             return self._lookup_path_name(node.id)
         if isinstance(node, ast.Attribute) and node.attr == "Path":
-            if self._path_identity(node.value) == _PATH_MODULE:
+            if self._path_identity(node.value) & _PATH_MODULE:
                 return _PATH_CONSTRUCTOR
         if isinstance(node, ast.Call) and self._is_path_constructor(node.func):
             return _PATH_INSTANCE
         return _PATH_UNKNOWN
 
     def _is_path_constructor(self, node: ast.AST) -> bool:
-        return self._path_identity(node) == _PATH_CONSTRUCTOR
+        return bool(self._path_identity(node) & _PATH_CONSTRUCTOR)
 
     def _is_path_constructor_call(self, node: ast.AST) -> bool:
         return isinstance(node, ast.Call) and self._is_path_constructor(node.func)
@@ -259,23 +284,97 @@ class _RiskVisitor(ast.NodeVisitor):
             return None
         return _literal_path(node.args[0])
 
-    def _bind_path_name(self, name: str, identity: str) -> None:
+    def _bind_path_name(self, name: str, identity: int) -> None:
         self.path_scopes[-1][1][name] = identity
 
-    def _bind_path_target(self, target: ast.AST, identity: str) -> None:
+    def _bind_path_target(self, target: ast.AST, identity: int) -> None:
         if isinstance(target, ast.Name):
             self._bind_path_name(target.id, identity)
+        elif isinstance(target, ast.Starred):
+            self._bind_path_target(target.value, _PATH_UNKNOWN)
         elif isinstance(target, (ast.List, ast.Tuple)):
             for element in target.elts:
                 self._bind_path_target(element, _PATH_UNKNOWN)
 
     def _push_path_scope(
-        self, scope_kind: str, bindings: dict[str, str] | None = None
+        self, scope_kind: str, bindings: dict[str, int] | None = None
     ) -> None:
         self.path_scopes.append((scope_kind, bindings or {}))
 
     def _pop_path_scope(self) -> None:
         self.path_scopes.pop()
+
+    def _copy_path_state(
+        self, state: list[tuple[str, dict[str, int]]] | None = None
+    ) -> list[tuple[str, dict[str, int]]]:
+        source = self.path_scopes if state is None else state
+        return [(scope_kind, dict(bindings)) for scope_kind, bindings in source]
+
+    def _set_path_state(
+        self, state: list[tuple[str, dict[str, int]]]
+    ) -> None:
+        self.path_scopes = self._copy_path_state(state)
+
+    def _visible_before_scope(
+        self,
+        state: list[tuple[str, dict[str, int]]],
+        scope_index: int,
+        name: str,
+    ) -> int:
+        skip_class_scopes = state[-1][0] == "function"
+        for scope_kind, bindings in reversed(state[:scope_index]):
+            if skip_class_scopes and scope_kind == "class":
+                continue
+            if name in bindings:
+                return bindings[name]
+        return _PATH_UNKNOWN
+
+    def _merge_path_states(
+        self, states: list[list[tuple[str, dict[str, int]]]]
+    ) -> None:
+        if not states:
+            return
+        scope_count = len(states[0])
+        if any(len(state) != scope_count for state in states):
+            raise RuntimeError("Path scope stack became unbalanced.")
+
+        merged: list[tuple[str, dict[str, int]]] = []
+        for scope_index in range(scope_count):
+            scope_kind = states[0][scope_index][0]
+            if any(state[scope_index][0] != scope_kind for state in states):
+                raise RuntimeError("Path scope kinds became inconsistent.")
+            names = {
+                name
+                for state in states
+                for name in state[scope_index][1]
+            }
+            bindings: dict[str, int] = {}
+            for name in names:
+                identity = _PATH_UNKNOWN
+                present = False
+                for state in states:
+                    branch_bindings = state[scope_index][1]
+                    if name in branch_bindings:
+                        identity |= branch_bindings[name]
+                        present = True
+                    else:
+                        identity |= self._visible_before_scope(
+                            state, scope_index, name
+                        )
+                if present:
+                    bindings[name] = identity
+            merged.append((scope_kind, bindings))
+        self.path_scopes = merged
+
+    def _visit_statements_from(
+        self,
+        state: list[tuple[str, dict[str, int]]],
+        statements: list[ast.stmt],
+    ) -> list[tuple[str, dict[str, int]]]:
+        self._set_path_state(state)
+        for statement in statements:
+            self.visit(statement)
+        return self._copy_path_state()
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
@@ -326,7 +425,7 @@ class _RiskVisitor(ast.NodeVisitor):
             if node.value is not None
             else _PATH_UNKNOWN
         )
-        if self._path_identity(node.annotation) == _PATH_CONSTRUCTOR:
+        if self._path_identity(node.annotation) & _PATH_CONSTRUCTOR:
             identity = _PATH_INSTANCE
         self._bind_path_target(node.target, identity)
 
@@ -337,6 +436,98 @@ class _RiskVisitor(ast.NodeVisitor):
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         self.generic_visit(node)
         self._bind_path_target(node.target, _PATH_UNKNOWN)
+
+    def visit_If(self, node: ast.If) -> None:
+        self.visit(node.test)
+        base_state = self._copy_path_state()
+        body_state = self._visit_statements_from(base_state, node.body)
+        else_state = (
+            self._visit_statements_from(base_state, node.orelse)
+            if node.orelse
+            else base_state
+        )
+        self._merge_path_states([body_state, else_state])
+
+    def visit_While(self, node: ast.While) -> None:
+        self.visit(node.test)
+        base_state = self._copy_path_state()
+        body_state = self._visit_statements_from(base_state, node.body)
+        outcomes = [base_state, body_state]
+        if node.orelse:
+            outcomes.extend(
+                self._visit_statements_from(state, node.orelse)
+                for state in (base_state, body_state)
+            )
+        self._merge_path_states(outcomes)
+
+    def _visit_for(self, node: ast.For | ast.AsyncFor) -> None:
+        self.visit(node.iter)
+        base_state = self._copy_path_state()
+        self._set_path_state(base_state)
+        self._bind_path_target(node.target, _PATH_UNKNOWN)
+        for statement in node.body:
+            self.visit(statement)
+        body_state = self._copy_path_state()
+
+        outcomes = [base_state, body_state]
+        if node.orelse:
+            outcomes.extend(
+                self._visit_statements_from(state, node.orelse)
+                for state in (base_state, body_state)
+            )
+        self._merge_path_states(outcomes)
+
+    def visit_For(self, node: ast.For) -> None:
+        self._visit_for(node)
+
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+        self._visit_for(node)
+
+    def _visit_with(self, node: ast.With | ast.AsyncWith) -> None:
+        for item in node.items:
+            self.visit(item.context_expr)
+            if item.optional_vars is not None:
+                self._bind_path_target(item.optional_vars, _PATH_UNKNOWN)
+        for statement in node.body:
+            self.visit(statement)
+
+    def visit_With(self, node: ast.With) -> None:
+        self._visit_with(node)
+
+    def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
+        self._visit_with(node)
+
+    def _visit_try(self, node: ast.Try | ast.TryStar) -> None:
+        base_state = self._copy_path_state()
+        success_state = self._visit_statements_from(base_state, node.body)
+        if node.orelse:
+            success_state = self._visit_statements_from(
+                success_state, node.orelse
+            )
+        outcomes = [success_state]
+
+        for handler in node.handlers:
+            self._set_path_state(base_state)
+            if handler.type is not None:
+                self.visit(handler.type)
+            if handler.name is not None:
+                self._bind_path_name(handler.name, _PATH_UNKNOWN)
+            for statement in handler.body:
+                self.visit(statement)
+            outcomes.append(self._copy_path_state())
+
+        if node.finalbody:
+            outcomes = [
+                self._visit_statements_from(state, node.finalbody)
+                for state in outcomes
+            ]
+        self._merge_path_states(outcomes)
+
+    def visit_Try(self, node: ast.Try) -> None:
+        self._visit_try(node)
+
+    def visit_TryStar(self, node: ast.TryStar) -> None:
+        self._visit_try(node)
 
     def _visit_function(
         self, node: ast.FunctionDef | ast.AsyncFunctionDef
@@ -386,6 +577,45 @@ class _RiskVisitor(ast.NodeVisitor):
         self.visit(node.body)
         self._pop_path_scope()
 
+    def _visit_comprehension(
+        self,
+        generators: list[ast.comprehension],
+        result_nodes: tuple[ast.AST, ...],
+    ) -> None:
+        if not generators:
+            for result_node in result_nodes:
+                self.visit(result_node)
+            return
+
+        self.visit(generators[0].iter)
+        local_bindings = {
+            name: _PATH_UNKNOWN
+            for generator in generators
+            for name in _target_names(generator.target)
+        }
+        self._push_path_scope("function", local_bindings)
+        for condition in generators[0].ifs:
+            self.visit(condition)
+        for generator in generators[1:]:
+            self.visit(generator.iter)
+            for condition in generator.ifs:
+                self.visit(condition)
+        for result_node in result_nodes:
+            self.visit(result_node)
+        self._pop_path_scope()
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        self._visit_comprehension(node.generators, (node.elt,))
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        self._visit_comprehension(node.generators, (node.elt,))
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        self._visit_comprehension(node.generators, (node.key, node.value))
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        self._visit_comprehension(node.generators, (node.elt,))
+
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         for decorator in node.decorator_list:
             self.visit(decorator)
@@ -416,12 +646,11 @@ class _RiskVisitor(ast.NodeVisitor):
 
         if isinstance(node.func, ast.Attribute):
             receiver = node.func.value
+            receiver_identity = self._path_identity(receiver)
             if (
                 node.func.attr in _PATH_DELETE_METHODS
-                and (
-                    self._path_identity(receiver) == _PATH_INSTANCE
-                    or self._path_identity(receiver) == _PATH_CONSTRUCTOR
-                )
+                and receiver_identity
+                & (_PATH_INSTANCE | _PATH_CONSTRUCTOR)
             ):
                 self.categories.add("filesystem_delete")
             if node.func.attr in _PATH_READ_METHODS:
@@ -470,7 +699,7 @@ def _fallback_categories(source: str) -> set[str]:
     return categories
 
 
-def _scan_source(source: str) -> set[str]:
+def _scan_source(source: str, visitor: _RiskVisitor) -> set[str]:
     magic_categories = _magic_categories(source)
     try:
         tree = ast.parse(source)
@@ -481,9 +710,9 @@ def _scan_source(source: str) -> set[str]:
             *_fallback_categories(source),
         }
 
-    visitor = _RiskVisitor()
+    visitor.categories = set()
     visitor.visit(tree)
-    return visitor.categories
+    return set(visitor.categories)
 
 
 def _validated_cells(snapshot: Any) -> list[Mapping[str, Any]]:
@@ -502,6 +731,7 @@ def scan_snapshot(snapshot: Any) -> dict[str, Any]:
 
     findings: list[dict[str, Any]] = []
     seen_indexes: set[int] = set()
+    visitor = _RiskVisitor()
     for cell in _validated_cells(snapshot):
         cell_index = cell.get("index")
         if (
@@ -531,7 +761,7 @@ def scan_snapshot(snapshot: Any) -> dict[str, Any]:
         if not isinstance(source_text, str):
             raise ValueError("snapshot code cell source.text must be a string.")
 
-        for category in _scan_source(source_text):
+        for category in _scan_source(source_text, visitor):
             findings.append(_finding(cell_index, category))
 
     unique_findings = {
