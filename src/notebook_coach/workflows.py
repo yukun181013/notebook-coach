@@ -241,7 +241,6 @@ def validate_run(run_dir: str | Path) -> Path:
     run_id = baseline.get("run_id")
     if (
         not isinstance(run_id, str)
-        or run_id != directory.name
         or report_state.get("run_id") != run_id
     ):
         raise WorkflowError("run_id_mismatch", "Run artifact IDs do not match.")
