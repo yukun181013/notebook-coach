@@ -2,7 +2,7 @@
 
 ## Public project facts
 
-- [ ] Public repository approved, published, and anonymously readable.
+- [x] Public repository approved, published, and anonymously readable.
 - [x] Repository URL recorded: https://github.com/yukun181013/notebook-coach
 - [x] README includes Python 3.11, macOS/Linux, install, platform, privacy, and test instructions.
 - [x] Native Windows and WSL explicitly marked unverified.
@@ -21,7 +21,7 @@
 
 - [x] Script follows a 0:00–3:00 timeline.
 - [x] Narration choice confirmed by the user.
-- [ ] Exported video duration is strictly under three minutes.
+- [x] Exported video duration is strictly under three minutes: 118.08 seconds.
 - [ ] Public YouTube upload explicitly approved and anonymously playable.
 - [ ] Public YouTube URL recorded after upload approval.
 
@@ -31,7 +31,7 @@
 - [x] Fresh checkout tests pass: 325 tests in 5.66 seconds.
 - [x] Static diagnosis acceptance completes in 0.06 seconds, under five minutes.
 - [x] Static diagnosis acceptance preserves the source hash and kernel process set.
-- [ ] Public URLs contain no placeholders.
+- [x] Public URLs contain no placeholders.
 - [ ] User has reviewed the final Devpost field summary.
 - [ ] Final Devpost Submit action explicitly approved.
 - [ ] Devpost project page shows submitted rather than draft.
