@@ -277,6 +277,31 @@ def test_control_flow_merges_path_bindings_conservatively(
     assert [finding["cell_index"] for finding in delete_findings] == [0, 1, 2, 3]
 
 
+@pytest.mark.parametrize("method", ["unlink", "rmdir"])
+def test_try_handler_merges_intermediate_path_states(
+    snapshot_factory: SnapshotFactory,
+    method: str,
+):
+    source = (
+        "from pathlib import Path\n"
+        "def might_fail():\n"
+        "    raise RuntimeError('boom')\n"
+        "p = object()\n"
+        "try:\n"
+        "    p = Path('/tmp/x')\n"
+        "    might_fail()\n"
+        "    p = object()\n"
+        "except RuntimeError:\n"
+        "    pass\n"
+        f"p.{method}()"
+    )
+
+    result = scan_snapshot(snapshot_factory([source]))
+
+    assert _finding_for(result, "filesystem_delete")["severity"] == "high"
+    assert result["blocked"] is True
+
+
 def test_function_parameters_and_locals_are_scope_isolated(
     snapshot_factory: SnapshotFactory,
 ):

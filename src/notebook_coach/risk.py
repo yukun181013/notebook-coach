@@ -499,15 +499,23 @@ class _RiskVisitor(ast.NodeVisitor):
 
     def _visit_try(self, node: ast.Try | ast.TryStar) -> None:
         base_state = self._copy_path_state()
-        success_state = self._visit_statements_from(base_state, node.body)
+        self._set_path_state(base_state)
+        exception_states = [self._copy_path_state()]
+        for statement in node.body:
+            self.visit(statement)
+            exception_states.append(self._copy_path_state())
+        success_state = self._copy_path_state()
         if node.orelse:
             success_state = self._visit_statements_from(
                 success_state, node.orelse
             )
         outcomes = [success_state]
 
+        self._merge_path_states(exception_states)
+        handler_entry_state = self._copy_path_state()
+
         for handler in node.handlers:
-            self._set_path_state(base_state)
+            self._set_path_state(handler_entry_state)
             if handler.type is not None:
                 self.visit(handler.type)
             if handler.name is not None:
