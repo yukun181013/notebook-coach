@@ -302,6 +302,32 @@ def test_try_handler_merges_intermediate_path_states(
     assert result["blocked"] is True
 
 
+@pytest.mark.parametrize(
+    "operation",
+    ["1 / 0", "assert False", "[][0]"],
+    ids=["binary-operation", "assertion", "subscription"],
+)
+def test_try_handler_records_implicit_exception_states(
+    snapshot_factory: SnapshotFactory,
+    operation: str,
+):
+    source = (
+        "from pathlib import Path\n"
+        "try:\n"
+        "    p = Path('/tmp/x')\n"
+        f"    {operation}\n"
+        "    p = None\n"
+        "except Exception:\n"
+        "    pass\n"
+        "p.unlink()"
+    )
+
+    result = scan_snapshot(snapshot_factory([source]))
+
+    assert _finding_for(result, "filesystem_delete")["severity"] == "high"
+    assert result["blocked"] is True
+
+
 def test_try_handler_uses_only_states_before_potential_exceptions(
     snapshot_factory: SnapshotFactory,
 ):

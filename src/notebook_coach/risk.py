@@ -137,6 +137,38 @@ _PATH_MODULE = 1 << 0
 _PATH_CONSTRUCTOR = 1 << 1
 _PATH_INSTANCE = 1 << 2
 
+_POTENTIAL_EXCEPTION_NODE_TYPES = (
+    ast.Assert,
+    ast.AsyncFor,
+    ast.AsyncWith,
+    ast.Attribute,
+    ast.AugAssign,
+    ast.Await,
+    ast.BinOp,
+    ast.BoolOp,
+    ast.Call,
+    ast.Compare,
+    ast.Delete,
+    ast.Dict,
+    ast.DictComp,
+    ast.For,
+    ast.FormattedValue,
+    ast.GeneratorExp,
+    ast.IfExp,
+    ast.Import,
+    ast.ImportFrom,
+    ast.ListComp,
+    ast.Match,
+    ast.Raise,
+    ast.Set,
+    ast.SetComp,
+    ast.Starred,
+    ast.Subscript,
+    ast.UnaryOp,
+    ast.With,
+    ast.YieldFrom,
+)
+
 
 class _FunctionBindingCollector(ast.NodeVisitor):
     def __init__(self) -> None:
@@ -237,6 +269,11 @@ class _RiskVisitor(ast.NodeVisitor):
         self.try_exception_state_recorders: list[
             tuple[int, list[list[tuple[str, dict[str, int]]]]]
         ] = []
+
+    def visit(self, node: ast.AST) -> Any:
+        if isinstance(node, _POTENTIAL_EXCEPTION_NODE_TYPES):
+            self._record_potential_exception()
+        return super().visit(node)
 
     def _resolve_name(self, node: ast.AST) -> str | None:
         name = _qualified_name(node)
@@ -676,7 +713,6 @@ class _RiskVisitor(ast.NodeVisitor):
         self._bind_path_name(node.name, _PATH_UNKNOWN)
 
     def visit_Call(self, node: ast.Call) -> None:
-        self._record_potential_exception()
         call_name = self._resolve_name(node.func)
 
         if call_name == "os.system":
@@ -709,10 +745,6 @@ class _RiskVisitor(ast.NodeVisitor):
             if path is not None and _looks_like_credential_path(path):
                 self.categories.add("credential_read")
 
-        self.generic_visit(node)
-
-    def visit_Raise(self, node: ast.Raise) -> None:
-        self._record_potential_exception()
         self.generic_visit(node)
 
 
