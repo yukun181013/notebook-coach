@@ -11,7 +11,7 @@ from typing import Any
 import nbformat
 
 from notebook_coach import RUBRIC_VERSION, SCHEMA_VERSION
-from notebook_coach.scoring import DEDUCTIONS, score_issues
+from notebook_coach.scoring import DEDUCTIONS, WEIGHTS, score_issues
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -103,8 +103,8 @@ def render_report(
 
     score = baseline["score"]
     lines.extend(["## Learning Evidence Score", ""])
-    for dimension, points in score["dimensions"].items():
-        lines.append(f"- {dimension}: {points}")
+    for dimension in WEIGHTS:
+        lines.append(f"- {dimension}: {score['dimensions'][dimension]}")
     lines.extend([f"- Total: **{score['total']}/100**", ""])
 
     lines.extend(["## Recommended Challenges", ""])

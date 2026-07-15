@@ -4,12 +4,14 @@ import hashlib
 import json
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from types import SimpleNamespace
 
 import nbformat
 import pytest
 from nbformat import NotebookNode
 
 from notebook_coach import SCHEMA_VERSION
+from notebook_coach.cli import main as cli_main
 from notebook_coach.risk import build_source_risk_metadata
 from notebook_coach.sanitize import redact_text, summarize_text
 
@@ -185,3 +187,34 @@ def snapshot(snapshot_factory) -> dict:
             "weights = scores.softmax(axis=0)",
         ]
     )
+
+
+@pytest.fixture
+def notebook_path(notebook_factory) -> Path:
+    return notebook_factory(
+        cells=[
+            nbformat.v4.new_code_cell(
+                "import numpy as np\nscores = np.array([[1.0, 2.0]])"
+            ),
+            nbformat.v4.new_code_cell(
+                "weights = np.exp(scores) / np.exp(scores).sum(axis=0)"
+            ),
+        ]
+    )
+
+
+@pytest.fixture
+def cli_runner(capsys):
+    def run(*arguments: str):
+        try:
+            exit_code = cli_main(list(arguments))
+        except SystemExit as error:
+            exit_code = int(error.code)
+        captured = capsys.readouterr()
+        return SimpleNamespace(
+            exit_code=exit_code,
+            stdout=captured.out,
+            stderr=captured.err,
+        )
+
+    return run
