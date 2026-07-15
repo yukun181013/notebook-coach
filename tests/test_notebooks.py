@@ -19,6 +19,16 @@ from notebook_coach.notebooks import (
 SECRET = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
 
 
+def _visible_summary_chars(value):
+    if isinstance(value, dict):
+        if {"text", "original_chars", "sha256", "truncated"} <= set(value):
+            return len(value["text"])
+        return sum(_visible_summary_chars(item) for item in value.values())
+    if isinstance(value, list):
+        return sum(_visible_summary_chars(item) for item in value)
+    return 0
+
+
 def test_snapshot_is_redacted_bounded_and_hashes_original(notebook_factory):
     path = notebook_factory(code="OPENAI_API_KEY='sk-proj-abcdefghijklmnopqrstuvwxyz123456'")
     before = path.read_bytes()
@@ -313,9 +323,46 @@ def test_saved_module_not_found_error_is_static_sanitized_evidence(notebook_fact
 
     assert error["output_type"] == "error"
     assert error["ename"] == "ModuleNotFoundError"
-    assert "ModuleNotFoundError: missing" in error["traceback"][1]["text"]
+    assert isinstance(error["traceback"], dict)
+    assert set(error["traceback"]) == {
+        "text",
+        "original_chars",
+        "sha256",
+        "truncated",
+    }
+    assert "Traceback:" in error["traceback"]["text"]
+    assert "ModuleNotFoundError: missing" in error["traceback"]["text"]
     assert SECRET not in str(error)
     assert "[REDACTED]" in str(error)
+
+
+def test_error_traceback_is_one_bounded_summary(notebook_factory):
+    traceback = [f"frame-{index:04d} " + "x" * 24 for index in range(1_000)]
+    traceback[0] = f"frame-0000 api_key={SECRET}"
+    output = nbformat.v4.new_output(
+        "error",
+        ename="ModuleNotFoundError",
+        evalue="No module named 'missing'",
+        traceback=traceback,
+    )
+    path = notebook_factory(code="import missing", outputs=[output])
+
+    snapshot = build_snapshot(path)
+    saved_traceback = snapshot["cells"][0]["outputs"][0]["traceback"]
+
+    assert isinstance(saved_traceback, dict)
+    assert set(saved_traceback) == {
+        "text",
+        "original_chars",
+        "sha256",
+        "truncated",
+    }
+    assert len(saved_traceback["text"]) <= 4_000
+    assert saved_traceback["truncated"] is True
+    assert "frame-0000" in saved_traceback["text"]
+    assert snapshot["sanitization"]["truncated_fields"] == 1
+    assert SECRET not in str(snapshot)
+    assert len(json.dumps(snapshot)) < 20_000
 
 
 def test_text_outputs_are_redacted_and_bounded(notebook_factory):
@@ -339,6 +386,92 @@ def test_text_outputs_are_redacted_and_bounded(notebook_factory):
     assert displayed["truncated"] is False
     assert SECRET not in str(saved_outputs)
     assert "[REDACTED]" in str(saved_outputs)
+
+
+def test_saved_output_text_shares_one_snapshot_budget(notebook_factory):
+    outputs = [
+        nbformat.v4.new_output("stream", name="stdout", text="s" * 4_000)
+        for _ in range(10)
+    ]
+    outputs.extend(
+        [
+            nbformat.v4.new_output(
+                "display_data",
+                data={"text/plain": "d" * 4_000},
+            ),
+            nbformat.v4.new_output(
+                "error",
+                ename="RuntimeError",
+                evalue="e" * 4_000,
+                traceback=["t" * 4_000],
+            ),
+            nbformat.v4.new_output(
+                "stream",
+                name="stderr",
+                text=f"last={SECRET}",
+            ),
+        ]
+    )
+    path = notebook_factory(code="q" * 60_000, outputs=outputs)
+
+    snapshot = build_snapshot(path)
+    saved_outputs = snapshot["cells"][0]["outputs"]
+
+    assert len(snapshot["cells"][0]["source"]["text"]) == 60_000
+    assert _visible_summary_chars(saved_outputs) == 50_000
+    assert len(saved_outputs[-2]["traceback"]["text"]) == 2_000
+    assert saved_outputs[-2]["traceback"]["truncated"] is True
+    assert saved_outputs[-1]["text"]["text"] == ""
+    assert saved_outputs[-1]["text"]["truncated"] is True
+    assert snapshot["sanitization"]["truncated_fields"] == 2
+    assert SECRET not in str(snapshot)
+
+
+def test_saved_evidence_item_limit_counts_output_entries(notebook_factory):
+    outputs = [
+        nbformat.v4.new_output("stream", name="stdout", text="x")
+        for _ in range(501)
+    ]
+    path = notebook_factory(code="pass", outputs=outputs)
+
+    with pytest.raises(SnapshotLimitError, match=r"--cells 1-20"):
+        build_snapshot(path)
+
+
+def test_saved_evidence_item_limit_counts_mime_items(notebook_factory):
+    data = {f"application/x-item-{index}": "x" for index in range(500)}
+    output = nbformat.v4.new_output("display_data", data=data)
+    path = notebook_factory(code="display(result)", outputs=[output])
+
+    with pytest.raises(SnapshotLimitError, match=r"--cells 1-20"):
+        build_snapshot(path)
+
+
+def test_saved_evidence_item_limit_counts_attachment_mime_items(notebook_factory):
+    attachments = {
+        f"file-{index}.bin": {"application/octet-stream": "x"}
+        for index in range(501)
+    }
+    path = notebook_factory(markdown="attachments", attachments=attachments)
+
+    with pytest.raises(SnapshotLimitError, match=r"--cells 1-20"):
+        build_snapshot(path)
+
+
+def test_saved_evidence_limit_ignores_unselected_cells(notebook_factory):
+    oversized = nbformat.v4.new_code_cell(
+        "unselected",
+        outputs=[
+            nbformat.v4.new_output("stream", name="stdout", text="x")
+            for _ in range(501)
+        ],
+    )
+    selected = nbformat.v4.new_code_cell("selected")
+    path = notebook_factory(cells=[oversized, selected])
+
+    snapshot = build_snapshot(path, selected_cells=[1])
+
+    assert [cell["index"] for cell in snapshot["cells"]] == [1]
 
 
 def test_binary_output_body_is_omitted_with_stable_metadata(notebook_factory):

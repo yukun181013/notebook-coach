@@ -18,6 +18,8 @@ from notebook_coach.sanitize import redact_text, summarize_text
 MAX_SELECTED_CELLS = 200
 MAX_SOURCE_CHARS = 150_000
 MAX_OUTPUT_CHARS = 4_000
+MAX_SNAPSHOT_OUTPUT_CHARS = 50_000
+MAX_SAVED_EVIDENCE_ITEMS = 500
 MAX_DESCRIPTOR_CHARS = 200
 
 _CELL_SELECTION_HELP = "Use --cells 1-20 with 1-based cell numbers."
@@ -42,6 +44,7 @@ class _SanitizationState:
         self.redacted_fields = 0
         self.truncated_fields = 0
         self.omitted_binary_fields = 0
+        self.remaining_output_chars = MAX_SNAPSHOT_OUTPUT_CHARS
 
     def summarize(self, text: str, *, max_chars: int) -> dict[str, Any]:
         _, labels = redact_text(text)
@@ -51,6 +54,14 @@ class _SanitizationState:
             self.redacted_fields += 1
         if summary["truncated"]:
             self.truncated_fields += 1
+        return summary
+
+    def summarize_output(self, text: str) -> dict[str, Any]:
+        summary = self.summarize(
+            text,
+            max_chars=min(MAX_OUTPUT_CHARS, self.remaining_output_chars),
+        )
+        self.remaining_output_chars -= len(summary["text"])
         return summary
 
     def descriptor(self, text: str) -> str:
@@ -252,9 +263,7 @@ def _safe_mime_bundle(
             items.append(
                 {
                     "mime_type": state.descriptor(mime_type),
-                    "text": state.summarize(
-                        _stable_body_text(body), max_chars=MAX_OUTPUT_CHARS
-                    ),
+                    "text": state.summarize_output(_stable_body_text(body)),
                 }
             )
         else:
@@ -271,9 +280,7 @@ def _safe_outputs(outputs: Iterable[Any], state: _SanitizationState) -> list[dic
                 {
                     "output_type": "stream",
                     "name": state.descriptor(output["name"]),
-                    "text": state.summarize(
-                        _notebook_text(output["text"]), max_chars=MAX_OUTPUT_CHARS
-                    ),
+                    "text": state.summarize_output(_notebook_text(output["text"])),
                 }
             )
         elif output_type == "error":
@@ -281,15 +288,14 @@ def _safe_outputs(outputs: Iterable[Any], state: _SanitizationState) -> list[dic
                 {
                     "output_type": "error",
                     "ename": state.descriptor(output["ename"]),
-                    "evalue": state.summarize(
-                        _notebook_text(output["evalue"]), max_chars=MAX_OUTPUT_CHARS
+                    "evalue": state.summarize_output(
+                        _notebook_text(output["evalue"])
                     ),
-                    "traceback": [
-                        state.summarize(
-                            _notebook_text(line), max_chars=MAX_OUTPUT_CHARS
+                    "traceback": state.summarize_output(
+                        "\n".join(
+                            _notebook_text(line) for line in output["traceback"]
                         )
-                        for line in output["traceback"]
-                    ],
+                    ),
                 }
             )
         elif output_type in {"display_data", "execute_result"}:
@@ -324,6 +330,25 @@ def _safe_optional_descriptor(value: Any, state: _SanitizationState) -> str | No
     return state.descriptor(value)
 
 
+def _saved_evidence_items(notebook: Any, indexes: Iterable[int]) -> int:
+    item_count = 0
+    for index in indexes:
+        cell = notebook.cells[index]
+        if cell["cell_type"] == "code":
+            outputs = cell.get("outputs", ())
+            item_count += len(outputs)
+            for output in outputs:
+                if output["output_type"] in {"display_data", "execute_result"}:
+                    item_count += len(output["data"])
+        elif cell["cell_type"] == "markdown":
+            for bundle in cell.get("attachments", {}).values():
+                item_count += len(bundle)
+
+        if item_count > MAX_SAVED_EVIDENCE_ITEMS:
+            return item_count
+    return item_count
+
+
 def build_snapshot(
     path: str | Path, selected_cells: Iterable[int] | None = None
 ) -> dict[str, Any]:
@@ -335,6 +360,13 @@ def build_snapshot(
     if len(indexes) > MAX_SELECTED_CELLS:
         raise SnapshotLimitError(
             f"Snapshot supports at most {MAX_SELECTED_CELLS} selected cells. "
+            f"{_CELL_SELECTION_HELP}"
+        )
+
+    if _saved_evidence_items(notebook, indexes) > MAX_SAVED_EVIDENCE_ITEMS:
+        raise SnapshotLimitError(
+            "Snapshot supports at most "
+            f"{MAX_SAVED_EVIDENCE_ITEMS} saved output and attachment evidence items. "
             f"{_CELL_SELECTION_HELP}"
         )
 
