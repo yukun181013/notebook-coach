@@ -278,6 +278,231 @@ def test_ast_symbols_persist_across_code_cells(
     assert result["blocked"] is True
 
 
+def test_cross_cell_module_alias_rebinding_stops_resolution(
+    snapshot_factory: SnapshotFactory,
+):
+    snapshot = snapshot_factory(
+        [
+            "import os as x",
+            (
+                "class Safe:\n"
+                "    def remove(self, path): pass\n"
+                "x = Safe()"
+            ),
+            "x.remove('/tmp/x')",
+        ]
+    )
+
+    result = scan_snapshot(snapshot)
+
+    assert result == {"blocked": False, "findings": []}
+
+
+def test_function_parameter_shadows_outer_module_alias(
+    snapshot_factory: SnapshotFactory,
+):
+    source = (
+        "import os as x\n"
+        "def safe_remove(x):\n"
+        "    x.remove('/tmp/x')"
+    )
+
+    result = scan_snapshot(snapshot_factory([source]))
+
+    assert result == {"blocked": False, "findings": []}
+
+
+def test_function_local_module_alias_does_not_leak(
+    snapshot_factory: SnapshotFactory,
+):
+    snapshot = snapshot_factory(
+        [
+            (
+                "def dangerous():\n"
+                "    import os as x\n"
+                "    x.remove('/tmp/x')"
+            ),
+            (
+                "def configure():\n"
+                "    import os as x\n"
+                "x.remove('/tmp/x')"
+            ),
+            "x.remove('/tmp/x')",
+        ]
+    )
+
+    result = scan_snapshot(snapshot)
+
+    delete_findings = [
+        finding
+        for finding in result["findings"]
+        if finding["category"] == "filesystem_delete"
+    ]
+    assert [finding["cell_index"] for finding in delete_findings] == [0]
+
+
+def test_from_import_alias_rebinding_stops_resolution(
+    snapshot_factory: SnapshotFactory,
+):
+    source = (
+        "from os import remove as zap\n"
+        "zap = print\n"
+        "zap('/tmp/x')"
+    )
+
+    result = scan_snapshot(snapshot_factory([source]))
+
+    assert result == {"blocked": False, "findings": []}
+
+
+def test_relative_import_alias_does_not_resolve_as_stdlib_module(
+    snapshot_factory: SnapshotFactory,
+):
+    source = "from . import os as x\nx.remove('/tmp/x')"
+
+    result = scan_snapshot(snapshot_factory([source]))
+
+    assert result == {"blocked": False, "findings": []}
+
+
+@pytest.mark.parametrize(
+    "sources",
+    [
+        ["import os as x", "x.remove('/tmp/x')"],
+        ["import os as x\ny = x\ny.remove('/tmp/x')"],
+        ["from os import remove as zap\nzap('/tmp/x')"],
+        ["x = object()\nimport os as x\nx.remove('/tmp/x')"],
+    ],
+    ids=["cross-cell", "simple-alias", "from-import", "import-over-shadow"],
+)
+def test_generic_alias_dangerous_controls_remain_blocked(
+    snapshot_factory: SnapshotFactory,
+    sources: list[str],
+):
+    result = scan_snapshot(snapshot_factory(sources))
+
+    assert _finding_for(result, "filesystem_delete")["severity"] == "high"
+    assert result["blocked"] is True
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "import os as x\n"
+            "if condition:\n"
+            "    x = object()\n"
+            "x.remove('/tmp/x')"
+        ),
+        (
+            "import os as x\n"
+            "match value:\n"
+            "    case 'safe':\n"
+            "        x = object()\n"
+            "    case _:\n"
+            "        pass\n"
+            "x.remove('/tmp/x')"
+        ),
+    ],
+    ids=["if", "match"],
+)
+def test_branch_with_possible_module_alias_remains_blocked(
+    snapshot_factory: SnapshotFactory,
+    source: str,
+):
+    result = scan_snapshot(snapshot_factory([source]))
+
+    assert _finding_for(result, "filesystem_delete")["severity"] == "high"
+    assert result["blocked"] is True
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "import os as x\n"
+            "if condition:\n"
+            "    x = object()\n"
+            "else:\n"
+            "    x = object()\n"
+            "x.remove('/tmp/x')"
+        ),
+        (
+            "import os as x\n"
+            "match value:\n"
+            "    case 'first':\n"
+            "        x = object()\n"
+            "    case _:\n"
+            "        x = object()\n"
+            "x.remove('/tmp/x')"
+        ),
+    ],
+    ids=["if", "match"],
+)
+def test_all_branches_rebinding_module_alias_is_safe(
+    snapshot_factory: SnapshotFactory,
+    source: str,
+):
+    result = scan_snapshot(snapshot_factory([source]))
+
+    assert result == {"blocked": False, "findings": []}
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import os as x\nfor x in values:\n    x.remove('/tmp/x')",
+        (
+            "import os as x\n"
+            "with manager() as x:\n"
+            "    x.remove('/tmp/x')"
+        ),
+        (
+            "import os as x\n"
+            "try:\n"
+            "    risky()\n"
+            "except Exception as x:\n"
+            "    x.remove('/tmp/x')"
+        ),
+        (
+            "import os as x\n"
+            "match value:\n"
+            "    case {'x': x}:\n"
+            "        x.remove('/tmp/x')"
+        ),
+        "import os as x\n[x.remove('/tmp/x') for x in values]",
+        (
+            "import os as x\n"
+            "class Container:\n"
+            "    x = object()\n"
+            "    x.remove('/tmp/x')"
+        ),
+        (
+            "import os as x\n"
+            "def safe_remove():\n"
+            "    x = object()\n"
+            "    x.remove('/tmp/x')"
+        ),
+    ],
+    ids=[
+        "for",
+        "with",
+        "except",
+        "pattern",
+        "comprehension",
+        "class",
+        "function-local",
+    ],
+)
+def test_binding_targets_shadow_module_alias_in_their_scope(
+    snapshot_factory: SnapshotFactory,
+    source: str,
+):
+    result = scan_snapshot(snapshot_factory([source]))
+
+    assert result == {"blocked": False, "findings": []}
+
+
 def test_nested_function_rebinding_does_not_clear_outer_path_binding(
     snapshot_factory: SnapshotFactory,
 ):
