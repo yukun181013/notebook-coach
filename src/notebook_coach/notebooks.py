@@ -96,6 +96,13 @@ def _selection_error(message: str) -> NotebookInputError:
     return NotebookInputError(f"{message} {_CELL_SELECTION_HELP}")
 
 
+def _selected_cells_limit_error() -> SnapshotLimitError:
+    return SnapshotLimitError(
+        f"Snapshot supports at most {MAX_SELECTED_CELLS} selected cell entries. "
+        f"{_CELL_SELECTION_HELP}"
+    )
+
+
 def parse_cell_selection(selection: str, total_cells: int) -> list[int]:
     """Parse user-facing 1-based cell numbers into ordered zero-based indexes."""
 
@@ -116,12 +123,15 @@ def parse_cell_selection(selection: str, total_cells: int) -> list[int]:
 
         single = re.fullmatch(r"[0-9]+", token)
         interval = re.fullmatch(r"([0-9]+)-([0-9]+)", token)
-        if single:
-            start = end = int(token)
-        elif interval:
-            start, end = (int(value) for value in interval.groups())
-        else:
+        if not single and not interval:
             raise _selection_error(f"Invalid cell selection item {token!r}.")
+        try:
+            if single:
+                start = end = int(token)
+            else:
+                start, end = (int(value) for value in interval.groups())
+        except ValueError:
+            raise _selection_error("Cell selection contains an oversized number.") from None
 
         if start < 1 or end < 1:
             raise _selection_error("Cell numbers start at 1, not 0.")
@@ -189,6 +199,8 @@ def _normalize_selection(
     selected_cells: Iterable[int] | None, total_cells: int
 ) -> list[int]:
     if selected_cells is None:
+        if total_cells > MAX_SELECTED_CELLS:
+            raise _selected_cells_limit_error()
         return list(range(total_cells))
     if isinstance(selected_cells, (str, bytes)):
         raise NotebookInputError(
@@ -196,14 +208,16 @@ def _normalize_selection(
         )
 
     try:
-        indexes = list(selected_cells)
+        iterator = iter(selected_cells)
     except TypeError:
         raise NotebookInputError(
             "selected_cells must contain zero-based integer cell indexes."
         ) from None
 
     normalized: set[int] = set()
-    for index in indexes:
+    for entry_number, index in enumerate(iterator, start=1):
+        if entry_number > MAX_SELECTED_CELLS:
+            raise _selected_cells_limit_error()
         if (
             isinstance(index, bool)
             or not isinstance(index, int)
@@ -358,10 +372,7 @@ def build_snapshot(
 
     indexes = _normalize_selection(selected_cells, len(notebook.cells))
     if len(indexes) > MAX_SELECTED_CELLS:
-        raise SnapshotLimitError(
-            f"Snapshot supports at most {MAX_SELECTED_CELLS} selected cells. "
-            f"{_CELL_SELECTION_HELP}"
-        )
+        raise _selected_cells_limit_error()
 
     if _saved_evidence_items(notebook, indexes) > MAX_SAVED_EVIDENCE_ITEMS:
         raise SnapshotLimitError(

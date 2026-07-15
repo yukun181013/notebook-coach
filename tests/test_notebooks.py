@@ -188,6 +188,26 @@ def test_cell_selection_errors_are_public_and_actionable(selection):
     assert error.value.__cause__ is None
 
 
+@pytest.mark.parametrize(
+    "selection",
+    ["9" * 5_000, "1-" + "9" * 5_000],
+    ids=["single", "range"],
+)
+def test_oversized_numeric_cell_selection_is_a_short_public_error(selection):
+    with pytest.raises(NotebookInputError) as error:
+        parse_cell_selection(selection, total_cells=6)
+
+    assert "--cells" in str(error.value)
+    assert len(str(error.value)) < 300
+    assert selection not in str(error.value)
+    assert error.value.__cause__ is None
+
+
+def test_nonnumeric_cell_selection_is_not_reported_as_oversized():
+    with pytest.raises(NotebookInputError, match="Invalid cell selection item"):
+        parse_cell_selection("one", total_cells=6)
+
+
 def test_cell_selection_deduplicates_and_preserves_notebook_order():
     assert parse_cell_selection("5,2,5,1-2", total_cells=5) == [0, 1, 4]
 
@@ -197,6 +217,56 @@ def test_build_snapshot_rejects_invalid_zero_based_selection(notebook_factory):
 
     with pytest.raises(NotebookInputError, match="selected_cells"):
         build_snapshot(path, selected_cells=[1])
+
+
+def test_selected_cells_stops_after_the_201st_raw_entry(notebook_factory):
+    path = notebook_factory(code="pass")
+    requests = []
+
+    def guarded_selection():
+        for request in range(1, 203):
+            requests.append(request)
+            if request == 202:
+                raise AssertionError("selected_cells requested a 202nd item")
+            yield 0
+
+    with pytest.raises(SnapshotLimitError, match=r"--cells 1-20") as error:
+        build_snapshot(path, selected_cells=guarded_selection())
+
+    assert requests == list(range(1, 202))
+    assert error.value.__cause__ is None
+
+
+def test_selected_cells_allows_200_raw_entries(notebook_factory):
+    path = notebook_factory(code="pass")
+
+    snapshot = build_snapshot(path, selected_cells=(0 for _ in range(200)))
+
+    assert [cell["index"] for cell in snapshot["cells"]] == [0]
+
+
+def test_huge_range_selection_is_not_materialized(monkeypatch):
+    def forbidden_list(_value):
+        raise AssertionError("selected_cells range was materialized")
+
+    monkeypatch.setattr(notebooks_module, "list", forbidden_list, raising=False)
+
+    with pytest.raises(NotebookInputError, match="selected_cells") as error:
+        notebooks_module._normalize_selection(range(10**9), total_cells=1)
+
+    assert error.value.__cause__ is None
+
+
+def test_default_selection_rejects_cell_limit_before_building_range(monkeypatch):
+    def forbidden_range(_total):
+        raise AssertionError("default cell range was materialized")
+
+    monkeypatch.setattr(notebooks_module, "range", forbidden_range, raising=False)
+
+    with pytest.raises(SnapshotLimitError, match=r"--cells 1-20") as error:
+        notebooks_module._normalize_selection(None, total_cells=201)
+
+    assert error.value.__cause__ is None
 
 
 def test_default_cell_limit_is_checked_after_selection(notebook_factory):
