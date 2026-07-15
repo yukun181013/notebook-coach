@@ -355,6 +355,43 @@ def test_control_flow_merges_path_bindings_conservatively(
     assert [finding["cell_index"] for finding in delete_findings] == [0, 1, 2, 3]
 
 
+def test_match_cases_start_from_the_same_path_state(
+    snapshot_factory: SnapshotFactory,
+):
+    source = (
+        "from pathlib import Path\n"
+        "p = Path('/tmp/x')\n"
+        "match choice:\n"
+        "    case 'replace':\n"
+        "        p = object()\n"
+        "    case 'delete':\n"
+        "        p.unlink()"
+    )
+
+    result = scan_snapshot(snapshot_factory([source]))
+
+    assert _finding_for(result, "filesystem_delete")["severity"] == "high"
+    assert result["blocked"] is True
+
+
+def test_match_pattern_binding_shadows_outer_path_identity(
+    snapshot_factory: SnapshotFactory,
+):
+    source = (
+        "from pathlib import Path\n"
+        "class Fake:\n"
+        "    def unlink(self): pass\n"
+        "p = Path('/tmp/x')\n"
+        "match {'p': Fake()}:\n"
+        "    case {'p': p}:\n"
+        "        p.unlink()"
+    )
+
+    result = scan_snapshot(snapshot_factory([source]))
+
+    assert result == {"blocked": False, "findings": []}
+
+
 @pytest.mark.parametrize("method", ["unlink", "rmdir"])
 def test_try_handler_merges_intermediate_path_states(
     snapshot_factory: SnapshotFactory,
@@ -471,6 +508,32 @@ def test_try_handler_records_generator_consumed_by_unpacking_assignment(
         f"    {target} = (1 / 0 for _ in (1,))\n"
         "    p = None\n"
         "except ZeroDivisionError:\n"
+        "    p.unlink()"
+    )
+
+    result = scan_snapshot(snapshot_factory([source]))
+
+    assert _finding_for(result, "filesystem_delete")["severity"] == "high"
+    assert result["blocked"] is True
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["[a, b]", "(a, b)", "a, *rest, b"],
+    ids=["list", "tuple", "starred"],
+)
+def test_try_handler_records_unpacking_errors_before_binding(
+    snapshot_factory: SnapshotFactory,
+    target: str,
+):
+    source = (
+        "from pathlib import Path\n"
+        "p = None\n"
+        "try:\n"
+        "    p = Path('/tmp/x')\n"
+        f"    {target} = (1,)\n"
+        "    p = None\n"
+        "except ValueError:\n"
         "    p.unlink()"
     )
 
@@ -802,6 +865,75 @@ def test_obvious_credential_file_reads_are_blocked(
     assert result["blocked"] is True
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "from pathlib import Path\n"
+            "p = Path('~/.ssh/id_rsa')\n"
+            "p.read_text()"
+        ),
+        (
+            "from pathlib import Path\n"
+            "p = Path('~/.ssh/id_rsa')\n"
+            "alias = p\n"
+            "alias.read_text()"
+        ),
+        (
+            "from pathlib import Path\n"
+            "def read_key():\n"
+            "    p = Path('~/.ssh/id_rsa')\n"
+            "    return p.read_text()"
+        ),
+        (
+            "from pathlib import Path\n"
+            "if condition:\n"
+            "    p = Path('~/.ssh/id_rsa')\n"
+            "else:\n"
+            "    p = Path('data.csv')\n"
+            "p.read_text()"
+        ),
+    ],
+    ids=["direct", "alias", "function-scope", "branch-merge"],
+)
+def test_credential_path_identity_propagates_to_read_calls(
+    snapshot_factory: SnapshotFactory,
+    source: str,
+):
+    result = scan_snapshot(snapshot_factory([source]))
+
+    assert _finding_for(result, "credential_read")["severity"] == "high"
+    assert result["blocked"] is True
+
+
+def test_credential_path_identity_persists_across_cells(
+    snapshot_factory: SnapshotFactory,
+):
+    result = scan_snapshot(
+        snapshot_factory(
+            [
+                "from pathlib import Path\np = Path('~/.ssh/id_rsa')",
+                "p.read_text()",
+            ]
+        )
+    )
+
+    finding = _finding_for(result, "credential_read")
+    assert finding["cell_index"] == 1
+    assert finding["severity"] == "high"
+    assert result["blocked"] is True
+
+
+def test_ordinary_path_instance_data_read_is_not_blocked(
+    snapshot_factory: SnapshotFactory,
+):
+    source = "from pathlib import Path\np = Path('data.csv')\np.read_text()"
+
+    result = scan_snapshot(snapshot_factory([source]))
+
+    assert result == {"blocked": False, "findings": []}
+
+
 def test_ordinary_data_file_read_is_not_blocked(snapshot_factory: SnapshotFactory):
     result = scan_snapshot(snapshot_factory(["rows = open('data.csv').read()"]))
 
@@ -833,6 +965,21 @@ def test_syntax_fallback_still_detects_obvious_risky_patterns(
 
     categories = {finding["category"] for finding in result["findings"]}
     assert categories >= {"syntax_error", "subprocess", "shell"}
+    assert result["blocked"] is True
+
+
+def test_deep_valid_expression_fails_closed_without_recursion_error(
+    snapshot_factory: SnapshotFactory,
+):
+    source = "+".join(["x"] * 400)
+    assert len(source) == 799
+
+    try:
+        result = scan_snapshot(snapshot_factory([source]))
+    except RecursionError:
+        pytest.fail("risk analysis leaked RecursionError")
+
+    assert _finding_for(result, "analysis_limit")["severity"] == "high"
     assert result["blocked"] is True
 
 
@@ -940,4 +1087,21 @@ def test_invalid_snapshot_cell_shape_raises_clear_value_error(
         snapshot["cells"][0]["cell_type"] = "unknown"
 
     with pytest.raises(ValueError, match=message):
+        scan_snapshot(snapshot)
+
+
+@pytest.mark.parametrize("cell_type", ["markdown", "raw"])
+@pytest.mark.parametrize("source", [None, {}], ids=["none", "missing-text"])
+def test_non_code_cells_validate_common_source_shape(cell_type: str, source):
+    snapshot = {
+        "cells": [
+            {
+                "index": 0,
+                "cell_type": cell_type,
+                "source": source,
+            }
+        ]
+    }
+
+    with pytest.raises(ValueError, match="source.text"):
         scan_snapshot(snapshot)

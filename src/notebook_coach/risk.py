@@ -31,6 +31,7 @@ _PATH_READ_METHODS = {"open", "read_bytes", "read_text"}
 _VALID_CELL_TYPES = {"code", "markdown", "raw"}
 
 _SEVERITIES = {
+    "analysis_limit": "high",
     "credential_read": "high",
     "filesystem_delete": "high",
     "network": "high",
@@ -41,6 +42,7 @@ _SEVERITIES = {
     "syntax_error": "low",
 }
 _EXPLANATIONS = {
+    "analysis_limit": "Cell source exceeded static analysis limits.",
     "credential_read": "Cell may read a credential file.",
     "filesystem_delete": "Cell may delete files or directories.",
     "network": "Cell may access a network resource.",
@@ -54,6 +56,10 @@ _EXPLANATIONS = {
 _SOURCE_RISK_CATEGORIES = frozenset(_SEVERITIES) - {"risk_metadata"}
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _REDACTED_MARKER = "[REDACTED]"
+
+_MAX_ANALYSIS_SOURCE_CHARS = 150_000
+_MAX_ANALYSIS_AST_NODES = 20_000
+_MAX_ANALYSIS_AST_DEPTH = 200
 
 _PACKAGE_MAGIC = re.compile(
     r"^(?P<prefix>!|%{1,2})\s*(?:pip|conda)\s+install\b",
@@ -144,6 +150,7 @@ _PATH_UNKNOWN = 0
 _PATH_MODULE = 1 << 0
 _PATH_CONSTRUCTOR = 1 << 1
 _PATH_INSTANCE = 1 << 2
+_PATH_CREDENTIAL = 1 << 3
 
 _POTENTIAL_EXCEPTION_NODE_TYPES = (
     ast.Assert,
@@ -444,6 +451,16 @@ def _target_names(target: ast.AST) -> set[str]:
     return set()
 
 
+def _match_pattern_names(pattern: ast.pattern) -> set[str]:
+    names: set[str] = set()
+    for node in ast.walk(pattern):
+        if isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name is not None:
+            names.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest is not None:
+            names.add(node.rest)
+    return names
+
+
 class _RiskVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         self.categories: set[str] = set()
@@ -493,7 +510,12 @@ class _RiskVisitor(ast.NodeVisitor):
             if self._path_identity(node.value) & _PATH_MODULE:
                 return _PATH_CONSTRUCTOR
         if isinstance(node, ast.Call) and self._is_path_constructor(node.func):
-            return _PATH_INSTANCE
+            identity = _PATH_INSTANCE
+            if node.args:
+                path = _literal_path(node.args[0])
+                if path is not None and _looks_like_credential_path(path):
+                    identity |= _PATH_CREDENTIAL
+            return identity
         return _PATH_UNKNOWN
 
     def _is_path_constructor(self, node: ast.AST) -> bool:
@@ -645,7 +667,7 @@ class _RiskVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:
-        if isinstance(node.value, ast.GeneratorExp) and any(
+        if any(
             isinstance(target, (ast.List, ast.Tuple, ast.Starred))
             for target in node.targets
         ):
@@ -663,7 +685,7 @@ class _RiskVisitor(ast.NodeVisitor):
             else _PATH_UNKNOWN
         )
         if self._path_identity(node.annotation) & _PATH_CONSTRUCTOR:
-            identity = _PATH_INSTANCE
+            identity |= _PATH_INSTANCE
         self._bind_path_target(node.target, identity)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
@@ -684,6 +706,22 @@ class _RiskVisitor(ast.NodeVisitor):
             else base_state
         )
         self._merge_path_states([body_state, else_state])
+
+    def visit_Match(self, node: ast.Match) -> None:
+        self.visit(node.subject)
+        base_state = self._copy_path_state()
+        outcomes = [base_state]
+        for case in node.cases:
+            self._set_path_state(base_state)
+            self.visit(case.pattern)
+            for name in _match_pattern_names(case.pattern):
+                self._bind_path_name(name, _PATH_UNKNOWN)
+            if case.guard is not None:
+                self.visit(case.guard)
+            for statement in case.body:
+                self.visit(statement)
+            outcomes.append(self._copy_path_state())
+        self._merge_path_states(outcomes)
 
     def visit_While(self, node: ast.While) -> None:
         self.visit(node.test)
@@ -928,7 +966,9 @@ class _RiskVisitor(ast.NodeVisitor):
                 self.categories.add("filesystem_delete")
             if node.func.attr in _PATH_READ_METHODS:
                 path = self._path_from_constructor_call(receiver)
-                if path is not None and _looks_like_credential_path(path):
+                if receiver_identity & _PATH_CREDENTIAL or (
+                    path is not None and _looks_like_credential_path(path)
+                ):
                     self.categories.add("credential_read")
 
         if call_name in {"builtins.open", "io.open", "open"} and node.args:
@@ -972,19 +1012,49 @@ def _fallback_categories(source: str) -> set[str]:
     return categories
 
 
+def _ast_exceeds_analysis_limits(tree: ast.AST) -> bool:
+    stack = [(tree, 0)]
+    node_count = 0
+    while stack:
+        node, depth = stack.pop()
+        node_count += 1
+        if (
+            node_count > _MAX_ANALYSIS_AST_NODES
+            or depth > _MAX_ANALYSIS_AST_DEPTH
+        ):
+            return True
+        for child in ast.iter_child_nodes(node):
+            stack.append((child, depth + 1))
+    return False
+
+
 def _scan_source(source: str, visitor: _RiskVisitor) -> set[str]:
+    if len(source) > _MAX_ANALYSIS_SOURCE_CHARS:
+        return {"analysis_limit"}
+
     magic_categories = _magic_categories(source)
     try:
         tree = ast.parse(source)
-    except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError):
+    except (MemoryError, RecursionError):
+        return {"analysis_limit", *magic_categories}
+    except (SyntaxError, ValueError, TypeError):
         return {
             "syntax_error",
             *magic_categories,
             *_fallback_categories(source),
         }
 
+    try:
+        if _ast_exceeds_analysis_limits(tree):
+            return {"analysis_limit", *magic_categories}
+    except (MemoryError, RecursionError):
+        return {"analysis_limit", *magic_categories}
+
     visitor.categories = set()
-    visitor.visit(tree)
+    try:
+        visitor.visit(tree)
+    except (MemoryError, RecursionError):
+        return {"analysis_limit", *magic_categories}
     return set(visitor.categories)
 
 
@@ -1074,15 +1144,16 @@ def scan_snapshot(snapshot: Any) -> dict[str, Any]:
             raise ValueError(
                 "snapshot cell_type must be code, markdown, or raw."
             )
-        if cell_type != "code":
-            continue
 
         source = cell.get("source")
         if not isinstance(source, Mapping) or "text" not in source:
-            raise ValueError("snapshot code cell source.text must be present.")
+            raise ValueError("snapshot cell source.text must be present.")
         source_text = source.get("text")
         if not isinstance(source_text, str):
-            raise ValueError("snapshot code cell source.text must be a string.")
+            raise ValueError("snapshot cell source.text must be a string.")
+
+        if cell_type != "code":
+            continue
 
         categories = _scan_source(source_text, visitor)
         trusted_categories = _trusted_risk_categories(cell, source)
