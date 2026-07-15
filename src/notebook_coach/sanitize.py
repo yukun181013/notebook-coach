@@ -34,6 +34,31 @@ _NAMED_PATTERNS = (
             r"(?![A-Za-z0-9_])"
         ),
     ),
+    (
+        "authorization_bearer",
+        re.compile(
+            r"(?<![A-Za-z0-9_-])"
+            r"Bearer[ \t]+[-A-Za-z0-9._~+/=]{12,}"
+            r"(?![-A-Za-z0-9._~+/=])",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "slack_token",
+        re.compile(
+            r"(?<![A-Za-z0-9_-])"
+            r"xox[baprs]-[A-Za-z0-9-]{10,}"
+            r"(?![A-Za-z0-9-])"
+        ),
+    ),
+    (
+        "huggingface_token",
+        re.compile(
+            r"(?<![A-Za-z0-9_])"
+            r"hf_[A-Za-z0-9]{20,}"
+            r"(?![A-Za-z0-9_])"
+        ),
+    ),
 )
 
 _ASSIGNMENT_NAME_PATTERN = r"[A-Za-z_][A-Za-z0-9_.-]*"

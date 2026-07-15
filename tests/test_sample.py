@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import nbformat
+import pytest
 
 from notebook_coach.notebooks import build_snapshot
 from notebook_coach.risk import scan_snapshot
-from notebook_coach.workflows import validate_run
+from notebook_coach.workflows import WorkflowError, validate_run
 
 
 ROOT = Path(__file__).parents[1]
@@ -74,6 +76,42 @@ def test_checked_in_example_is_answer_free_and_validates():
     assert statuses == {"C-CODE": "needs_work", "C-CONCEPT": "needs_work"}
 
 
+def test_validate_run_rejects_tampered_verification_report(tmp_path: Path):
+    run_dir = tmp_path / "example"
+    shutil.copytree(EXAMPLE, run_dir)
+    (run_dir / "verification.md").write_text("tampered\n", encoding="utf-8")
+
+    with pytest.raises(WorkflowError) as error:
+        validate_run(run_dir)
+
+    assert error.value.code == "verification_report_mismatch"
+
+
+def test_validate_run_rejects_tampered_verification_score(tmp_path: Path):
+    run_dir = tmp_path / "example"
+    shutil.copytree(EXAMPLE, run_dir)
+    state_path = run_dir / ".notebook-coach/verification-state.json"
+    state = json.loads(state_path.read_text("utf-8"))
+    state["after_score"]["total"] = -999
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(WorkflowError) as error:
+        validate_run(run_dir)
+
+    assert error.value.code == "verification_score_mismatch"
+
+
+def test_validate_run_requires_verification_artifact_pair(tmp_path: Path):
+    run_dir = tmp_path / "example"
+    shutil.copytree(EXAMPLE, run_dir)
+    (run_dir / "verification.md").unlink()
+
+    with pytest.raises(WorkflowError) as error:
+        validate_run(run_dir)
+
+    assert error.value.code == "verification_artifact_pair"
+
+
 def test_example_evaluation_is_honest_and_contains_no_private_data():
     evaluation = (EXAMPLE / "evaluation.md").read_text("utf-8")
     assert "GPT-5.6" in evaluation
@@ -84,4 +122,3 @@ def test_example_evaluation_is_honest_and_contains_no_private_data():
     assert "source score" in evaluation.lower()
     assert "limitation" in evaluation.lower()
     assert "sk-" not in evaluation
-

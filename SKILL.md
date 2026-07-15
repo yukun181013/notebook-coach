@@ -14,9 +14,11 @@ Use this Skill only in a GPT-5.6 Codex session. Turn a Python Jupyter Notebook i
 - Never install packages for a Notebook or modify the source Notebook.
 - Treat temporary copies and timeouts as risk reduction, not an OS sandbox.
 - Never fabricate execution evidence. Mention runtime behavior only when an eligible execution log exists.
-- Write model JSON only to the CLI-provided assessment path. Do not invent a different path.
+- Write assessment JSON only to the CLI-provided `assessment_path`, and execution-review JSON only to the CLI-provided `review_path`. Do not invent a different path.
 
 Set `SKILL_DIR` to the directory containing this file. Run every local operation through `${SKILL_DIR}/.venv/bin/notebook-coach-tool`; do not rely on `PATH` or a global package.
+
+Use [`references/contracts.md`](references/contracts.md) as the canonical JSON contract reference for every model-authored artifact.
 
 ## Diagnose
 
@@ -30,7 +32,7 @@ Set `SKILL_DIR` to the directory containing this file. Run every local operation
 
 2. Read only the returned redacted `snapshot.json` and `risk.json`. Base each finding on a concrete cell. Do not infer unseen outputs or learner intent.
 
-3. Produce the canonical JSON contract with a summary, concept map, evidence-linked issues, `C-CODE`, and `C-CONCEPT`. Write it exactly to the CLI-provided assessment path named `diagnosis-assessment.json`.
+3. Read [the canonical contracts](references/contracts.md), then produce the diagnosis contract with a summary, concept map, evidence-linked issues, `C-CODE`, and `C-CONCEPT`. Write it exactly to the CLI-provided assessment path named `diagnosis-assessment.json`.
 
 4. Run `finalize-diagnosis --stage STAGE` and show the resulting report and unfilled challenge Notebook.
 
@@ -66,7 +68,7 @@ Execution always has two phases: prepare, then explicit user confirmation.
 
 An expired or cancelled request may be prepared as a new request when the target is unchanged. If the target hash changes before or during execution, do not reuse the request: return to a new static diagnosis or verification, obtain a new immutable analysis ID, then prepare and confirm again.
 
-If eligible runtime evidence materially changes confidence, create the canonical execution-review JSON and use `apply-execution-review`. Keep diagnosis updates, verification source updates, and verification challenge updates within their target boundaries.
+If eligible runtime evidence materially changes confidence, fill the execution-review contract from [the canonical contracts](references/contracts.md) at the `review_path` returned by `prepare-execution`, then use `apply-execution-review`. Keep diagnosis updates, verification source updates, and verification challenge updates within their target boundaries.
 
 ## Recheck
 
@@ -75,7 +77,7 @@ If eligible runtime evidence materially changes confidence, create the canonical
 3. If the CLI reports a path mismatch, show both paths and request a separate confirmation before adding `--confirm-source-mismatch`.
 4. If it reports a kernel mismatch or language mismatch, show baseline/current kernel and language and request a separate confirmation before adding `--confirm-environment-mismatch`.
 5. Read the redacted current-source snapshot, baseline issue subset, and redacted challenge-answer snapshot.
-6. Produce the canonical JSON contract covering every baseline issue exactly once, both challenge IDs exactly once, any sequential new issue IDs, and exactly one next learning target.
+6. Read [the canonical contracts](references/contracts.md), then produce the verification contract covering every baseline issue exactly once, both challenge IDs exactly once, any sequential new issue IDs, and exactly one next learning target.
 7. When challenge metadata is unverifiable, keep both challenge statuses `unverifiable`; source verification may still proceed.
 8. Write JSON exactly to the CLI-provided assessment path named `verification-assessment.json`.
 9. Run `finalize-verification --stage STAGE` and present source-score changes separately from challenge results.

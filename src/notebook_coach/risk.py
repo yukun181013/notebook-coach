@@ -65,7 +65,8 @@ _PACKAGE_MAGIC = re.compile(
     r"^(?P<prefix>!|%{1,2})\s*(?:pip|conda)\s+install\b",
     re.IGNORECASE,
 )
-_SHELL_CELL_MAGIC = re.compile(r"^%%(?:bash|sh|zsh)\b", re.IGNORECASE)
+_SHELL_LINE_MAGIC = re.compile(r"^%(?:run|sx|system)\b", re.IGNORECASE)
+_SHELL_CELL_MAGIC = re.compile(r"^%%(?:bash|sh|zsh|script)\b", re.IGNORECASE)
 
 _FALLBACK_PATTERNS = {
     "filesystem_delete": (
@@ -1099,6 +1100,30 @@ class _RiskVisitor(ast.NodeVisitor):
     def visit_Call(self, node: ast.Call) -> None:
         call_names = self._resolve_names(node.func)
 
+        if (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Call)
+            and isinstance(node.func.value.func, ast.Name)
+            and node.func.value.func.id == "get_ipython"
+        ):
+            method = node.func.attr
+            magic_name = _literal_path(node.args[0]) if node.args else None
+            if method in {"system", "getoutput"}:
+                self.categories.add("shell")
+            elif method == "run_line_magic" and magic_name in {
+                "run",
+                "sx",
+                "system",
+            }:
+                self.categories.add("shell")
+            elif method == "run_cell_magic" and magic_name in {
+                "bash",
+                "script",
+                "sh",
+                "zsh",
+            }:
+                self.categories.add("shell")
+
         if "os.system" in call_names:
             self.categories.add("shell")
         if call_names & _SUBPROCESS_CALLS or any(
@@ -1149,7 +1174,11 @@ def _magic_categories(source: str) -> set[str]:
             categories.add("package_install")
             if package_magic.group("prefix") == "!":
                 categories.add("shell")
-        if stripped.startswith("!") or _SHELL_CELL_MAGIC.match(stripped):
+        if (
+            stripped.startswith("!")
+            or _SHELL_LINE_MAGIC.match(stripped)
+            or _SHELL_CELL_MAGIC.match(stripped)
+        ):
             categories.add("shell")
     return categories
 

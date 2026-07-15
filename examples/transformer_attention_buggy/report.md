@@ -1,7 +1,7 @@
 # Notebook Coach Report
 
-Run ID: `20260715T160241Z-c4c6bced`  
-Revision: 1  
+Run ID: `20260715T160241Z-c4c6bced`
+Revision: 1
 Analysis mode: static
 
 ## Notebook Overview

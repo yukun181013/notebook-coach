@@ -9,6 +9,7 @@ from typing import Any
 
 import nbformat
 from nbclient import NotebookClient
+from nbclient.exceptions import CellTimeoutError
 
 
 def _cell_result(index: int, cell: Any) -> dict[str, Any]:
@@ -37,6 +38,24 @@ def _cell_result(index: int, cell: Any) -> dict[str, Any]:
     }
 
 
+def _timeout_cell_index(notebook: Any) -> int | None:
+    executed = [
+        index
+        for index, cell in enumerate(notebook.cells)
+        if cell.cell_type == "code" and cell.get("execution_count") is not None
+    ]
+    if executed:
+        return executed[-1]
+    return next(
+        (
+            index
+            for index, cell in enumerate(notebook.cells)
+            if cell.cell_type == "code"
+        ),
+        None,
+    )
+
+
 def run(input_path: Path, output_path: Path, kernel: str, cell_timeout: int) -> None:
     notebook = nbformat.read(input_path, as_version=4)
     client = NotebookClient(
@@ -45,15 +64,31 @@ def run(input_path: Path, output_path: Path, kernel: str, cell_timeout: int) -> 
         allow_errors=True,
         kernel_name=kernel,
     )
-    client.execute()
+    timed_out = False
+    timeout_summary: str | None = None
+    timeout_cell_index: int | None = None
+    try:
+        client.execute()
+    except CellTimeoutError as error:
+        timed_out = True
+        timeout_summary = str(error)
+        timeout_cell_index = _timeout_cell_index(notebook)
     cells = [
         _cell_result(index, cell)
         for index, cell in enumerate(notebook.cells)
         if cell.cell_type == "code"
     ]
+    if timed_out:
+        for cell in cells:
+            if cell["cell_index"] == timeout_cell_index:
+                cell["status"] = "timeout"
+                break
     result = {
         "cells": cells,
         "has_cell_errors": any(cell["status"] == "error" for cell in cells),
+        "timed_out": timed_out,
+        "timeout_cell_index": timeout_cell_index,
+        "timeout_summary": timeout_summary,
     }
     output_path.write_text(
         json.dumps(result, ensure_ascii=False, sort_keys=True), encoding="utf-8"

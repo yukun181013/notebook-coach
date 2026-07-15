@@ -102,9 +102,18 @@ def _handle_prepare_execution(args: argparse.Namespace) -> dict[str, Any]:
         cell_timeout=args.cell_timeout,
         total_timeout=args.total_timeout,
     )
+    review_path = (
+        Path(prepared.request["run_dir"])
+        / ".notebook-coach"
+        / "reviews"
+        / prepared.request["attempt_id"]
+        / "execution-review.json"
+    )
+    review_path.parent.mkdir(parents=True, exist_ok=True)
     return {
         "status": "awaiting_execution_confirmation",
         "request_path": str(prepared.request_path),
+        "review_path": str(review_path),
         "request": prepared.request,
     }
 

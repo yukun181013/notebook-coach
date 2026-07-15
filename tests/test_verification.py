@@ -179,6 +179,32 @@ def test_challenge_metadata_mismatch_forces_unverifiable_statuses(
     assert set(result.challenge_results.values()) == {"unverifiable"}
 
 
+def test_missing_challenge_remains_unverifiable_without_blocking_source_recheck(
+    notebook_path: Path,
+    tmp_path: Path,
+    valid_diagnosis: dict,
+    valid_verification: dict,
+):
+    run_dir = _run(notebook_path, tmp_path / "runs", valid_diagnosis)
+    (run_dir / "challenge.ipynb").unlink()
+
+    stage = prepare_verification(notebook_path, run_dir)
+    assessment = _verification(
+        valid_verification,
+        stage.run_id,
+        issue_statuses=("resolved", "remaining"),
+        challenge_statuses=("unverifiable", "unverifiable"),
+    )
+    result = finalize_verification(stage.stage_dir, assessment)
+
+    assert stage.challenge_verifiability == {
+        "verifiable": False,
+        "reason": "challenge_unreadable",
+    }
+    assert set(result.challenge_results.values()) == {"unverifiable"}
+    assert result.report_path.is_file()
+
+
 def test_challenge_snapshot_and_outputs_are_redacted_and_bounded(
     notebook_path: Path,
     tmp_path: Path,

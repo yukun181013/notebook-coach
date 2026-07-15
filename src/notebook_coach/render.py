@@ -29,13 +29,17 @@ def build_baseline(
     source = copy.deepcopy(snapshot["source"])
     if source_path is not None:
         source["path"] = str(Path(source_path).expanduser().resolve(strict=False))
+    evidence_origins = ["notebook_source"]
+    if any(cell.get("outputs") for cell in snapshot.get("cells", [])):
+        evidence_origins.append("saved_notebook_output")
     baseline = {
         "schema_version": SCHEMA_VERSION,
         "rubric_version": RUBRIC_VERSION,
         "run_id": assessment["run_id"],
+        "captured_at": assessment["run_id"].split("-", 1)[0],
         "immutable": True,
         "analysis_mode": "static",
-        "evidence_origins": ["notebook_source", "saved_notebook_output"],
+        "evidence_origins": evidence_origins,
         "source": source,
         "snapshot": copy.deepcopy(snapshot),
         "notebook_summary": assessment["notebook_summary"],
@@ -70,8 +74,8 @@ def render_report(
     lines = [
         "# Notebook Coach Report",
         "",
-        f"Run ID: `{baseline['run_id']}`  ",
-        f"Revision: {report_state['revision']}  ",
+        f"Run ID: `{baseline['run_id']}`",
+        f"Revision: {report_state['revision']}",
         "Analysis mode: static",
         "",
         "## Notebook Overview",
@@ -124,9 +128,12 @@ def render_report(
     lines.extend(["## Optional Execution Results and Limits", ""])
     reviews = report_state.get("execution_reviews", [])
     if not reviews:
-        lines.append(
-            "No notebook code was executed. Findings use source and saved-output evidence only."
+        evidence = (
+            "source and saved-output evidence"
+            if "saved_notebook_output" in baseline.get("evidence_origins", [])
+            else "source evidence"
         )
+        lines.append(f"No notebook code was executed. Findings use {evidence} only.")
     else:
         for review in reviews:
             lines.append(
@@ -206,7 +213,7 @@ def render_verification(state: dict[str, Any]) -> str:
     lines = [
         "# Notebook Coach Verification",
         "",
-        f"Run ID: `{state['run_id']}`  ",
+        f"Run ID: `{state['run_id']}`",
         f"Revision: {state['revision']}",
         "",
         "## Source notebook changes",

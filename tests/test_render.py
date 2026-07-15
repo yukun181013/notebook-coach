@@ -19,6 +19,8 @@ def test_rendered_diagnosis_artifacts_are_linked(snapshot, valid_diagnosis):
     challenge = build_challenge_notebook(valid_diagnosis)
 
     assert baseline["run_id"] == valid_diagnosis["run_id"]
+    assert baseline["captured_at"] == "20260715T080000Z"
+    assert baseline["evidence_origins"] == ["notebook_source"]
     assert baseline["score"]["total"] == 93
     assert "## Learning Evidence Score" in report
     assert "Revision: 1" in report
@@ -35,6 +37,19 @@ def test_rendered_diagnosis_artifacts_are_linked(snapshot, valid_diagnosis):
         "C-CONCEPT",
     ]
     assert "TODO" in "\n".join(cell.source for cell in challenge.cells)
+
+
+def test_saved_output_origin_is_declared_only_when_snapshot_contains_output(
+    snapshot, valid_diagnosis
+):
+    snapshot["cells"][0]["outputs"] = [{"output_type": "stream"}]
+
+    baseline = build_baseline(snapshot, valid_diagnosis)
+
+    assert baseline["evidence_origins"] == [
+        "notebook_source",
+        "saved_notebook_output",
+    ]
 
 
 def test_report_names_issue_ids_cells_and_all_six_sections(

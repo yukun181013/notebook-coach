@@ -31,6 +31,34 @@ def test_redacts_github_token_without_returning_original_value():
     assert labels == ["github_token"]
 
 
+@pytest.mark.parametrize(
+    ("label", "secret", "text"),
+    [
+        (
+            "authorization_bearer",
+            "eyJhbGciOiJIUzI1NiJ9.synthetic-signature-value",
+            "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.synthetic-signature-value",
+        ),
+        (
+            "slack_token",
+            "xoxb" + "-123456789012-abcdefghijklmnopqrstuvwxyz",
+            "token " + "xoxb" + "-123456789012-abcdefghijklmnopqrstuvwxyz",
+        ),
+        (
+            "huggingface_token",
+            "hf_abcdefghijklmnopqrstuvwxyz123456",
+            "token hf_abcdefghijklmnopqrstuvwxyz123456",
+        ),
+    ],
+)
+def test_redacts_common_bearer_and_provider_tokens(label, secret, text):
+    cleaned, labels = redact_text(text)
+
+    assert secret not in repr((cleaned, labels))
+    assert "[REDACTED]" in cleaned
+    assert labels == [label]
+
+
 def test_redacts_entire_pem_private_key_without_returning_original_value():
     secret = """-----BEGIN PRIVATE KEY-----
 not-a-real-private-key-payload

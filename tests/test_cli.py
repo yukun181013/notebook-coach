@@ -151,3 +151,46 @@ def test_validate_run_detects_report_tampering(
 
     assert result.exit_code == 2
     assert json.loads(result.stderr)["code"] == "report_mismatch"
+
+
+def test_prepare_execution_cli_provides_run_scoped_review_path(
+    cli_runner, notebook_path: Path, tmp_path: Path
+):
+    prepared = json.loads(
+        cli_runner(
+            "prepare-diagnosis",
+            str(notebook_path),
+            "--output-root",
+            str(tmp_path / "runs"),
+        ).stdout
+    )
+    assessment = json.loads(
+        (Path(__file__).parent / "fixtures/diagnosis-assessment.json").read_text(
+            "utf-8"
+        )
+    )
+    assessment["run_id"] = prepared["run_id"]
+    Path(prepared["assessment_path"]).write_text(
+        json.dumps(assessment), encoding="utf-8"
+    )
+    finalized = json.loads(
+        cli_runner("finalize-diagnosis", "--stage", prepared["stage"]).stdout
+    )
+
+    result = cli_runner(
+        "prepare-execution",
+        "--run",
+        finalized["run_dir"],
+        "--phase",
+        "diagnosis",
+        "--target",
+        "source",
+    )
+    payload = json.loads(result.stdout)
+
+    assert result.exit_code == 0
+    assert payload["review_path"] == str(
+        Path(finalized["run_dir"])
+        / ".notebook-coach/reviews/A001/execution-review.json"
+    )
+    assert Path(payload["review_path"]).parent.is_dir()

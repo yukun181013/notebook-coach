@@ -139,14 +139,23 @@ def _target_binding(run_dir: Path, phase: str, target: str) -> dict[str, Any]:
     return binding
 
 
-def _cleanup_paths(metadata: dict[str, Any]) -> None:
+def _cleanup_paths(run_dir: Path, metadata: dict[str, Any]) -> None:
+    state_dir = run_dir.resolve(strict=False) / ".notebook-coach"
+    temp_root = (state_dir / "execution-temp").resolve(strict=False)
+    request_root = (state_dir / "requests").resolve(strict=False)
     temp_dir = metadata.get("temp_dir")
     if isinstance(temp_dir, str):
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        temporary = Path(temp_dir).resolve(strict=False)
+        if temporary != temp_root and temporary.is_relative_to(temp_root):
+            shutil.rmtree(temporary, ignore_errors=True)
     request_path = metadata.get("request_path")
     if isinstance(request_path, str):
-        request = Path(request_path)
-        if request.parent.name:
+        request = Path(request_path).resolve(strict=False)
+        if (
+            request.name == "execution-request.json"
+            and request.parent != request_root
+            and request.parent.is_relative_to(request_root)
+        ):
             shutil.rmtree(request.parent, ignore_errors=True)
 
 
@@ -187,7 +196,7 @@ def prepare_execution(
     store = RunStore(directory.parent)
     current = now().astimezone(timezone.utc)
     for metadata in store.recover_stale_attempts(directory, now=current):
-        _cleanup_paths(metadata)
+        _cleanup_paths(directory, metadata)
 
     binding = _target_binding(directory, phase, target)
     target_path = Path(binding["path"])
@@ -220,12 +229,20 @@ def prepare_execution(
     ).resolve()
     expires_at = current + timedelta(hours=1)
     metadata = {
+        "run_id": binding["run_id"],
         "phase": phase,
         "target": target,
         "request_id": request_id,
         "request_path": str(request_path),
         "temp_dir": str(temp_dir),
+        "target_path": str(target_path),
+        "target_sha256": target_sha256,
+        "analysis_id": binding["analysis_id"],
+        "kernel_name": binding["kernel_name"],
+        "cell_timeout": cell_timeout,
         "total_timeout": total_timeout,
+        "risk": risk,
+        "created_at": current.isoformat(),
         "expires_at": expires_at.isoformat(),
     }
     try:
@@ -268,7 +285,7 @@ def prepare_execution(
     return ExecutionPreparation(request_path=request_path, request=request)
 
 
-def _read_request(path: str | Path) -> tuple[Path, dict[str, Any]]:
+def _read_request(path: str | Path) -> tuple[Path, Path, dict[str, Any]]:
     request_path = Path(path).expanduser().resolve(strict=False)
     request = _read_object(
         request_path, code="request_invalid", label="Execution request"
@@ -294,13 +311,69 @@ def _read_request(path: str | Path) -> tuple[Path, dict[str, Any]]:
     }
     if set(request) != required or request.get("schema_version") != SCHEMA_VERSION:
         raise ExecutionBlockedError("request_invalid", "Execution request is invalid.")
-    return request_path, request
+    try:
+        run_dir = request_path.parents[3]
+    except IndexError:
+        raise ExecutionBlockedError(
+            "request_binding_mismatch", "Execution request path is not run-scoped."
+        ) from None
+    expected_parent = (
+        run_dir
+        / ".notebook-coach"
+        / "requests"
+        / str(request.get("request_id"))
+    ).resolve(strict=False)
+    if (
+        request_path.name != "execution-request.json"
+        or request_path.parent != expected_parent
+        or request.get("run_dir") != str(run_dir)
+    ):
+        raise ExecutionBlockedError(
+            "request_binding_mismatch", "Execution request path binding is invalid."
+        )
+    return request_path, run_dir, request
+
+
+def _validate_request_binding(
+    store: RunStore,
+    run_dir: Path,
+    request_path: Path,
+    request: dict[str, Any],
+) -> None:
+    try:
+        entry = store.get_attempt(run_dir, request["attempt_id"])
+    except RunStoreError:
+        raise ExecutionBlockedError(
+            "request_binding_mismatch", "Execution request ledger binding is invalid."
+        ) from None
+    metadata = entry.get("metadata")
+    expected = {
+        "run_id": request["run_id"],
+        "phase": request["phase"],
+        "target": request["target"],
+        "request_id": request["request_id"],
+        "request_path": str(request_path),
+        "temp_dir": request["temp_dir"],
+        "target_path": request["target_path"],
+        "target_sha256": request["target_sha256"],
+        "analysis_id": request["analysis_id"],
+        "kernel_name": request["kernel_name"],
+        "cell_timeout": request["cell_timeout"],
+        "total_timeout": request["total_timeout"],
+        "risk": request["risk"],
+        "created_at": request["created_at"],
+        "expires_at": request["expires_at"],
+    }
+    if entry.get("status") != "prepared" or metadata != expected:
+        raise ExecutionBlockedError(
+            "request_binding_mismatch", "Execution request ledger binding is invalid."
+        )
 
 
 def cancel_execution(request_path: str | Path) -> None:
-    path, request = _read_request(request_path)
-    run_dir = Path(request["run_dir"]).resolve(strict=False)
+    path, run_dir, request = _read_request(request_path)
     store = RunStore(run_dir.parent)
+    _validate_request_binding(store, run_dir, path, request)
     try:
         store.transition_attempt(
             run_dir,
@@ -313,7 +386,9 @@ def cancel_execution(request_path: str | Path) -> None:
         raise ExecutionBlockedError(
             "request_not_prepared", "Execution request is no longer pending."
         ) from None
-    _cleanup_paths({"temp_dir": request["temp_dir"], "request_path": str(path)})
+    _cleanup_paths(
+        run_dir, {"temp_dir": request["temp_dir"], "request_path": str(path)}
+    )
 
 
 def _sanitize(value: Any, *, depth: int = 0) -> Any:
@@ -397,7 +472,7 @@ def execute_request(
     *,
     now: Callable[[], datetime] = _utc_now,
 ) -> Path:
-    path, request = _read_request(request_path)
+    path, run_dir, request = _read_request(request_path)
     if (
         not isinstance(confirmed_target_sha256, str)
         or confirmed_target_sha256 != request["target_sha256"]
@@ -406,8 +481,8 @@ def execute_request(
             "confirmation_hash_mismatch",
             "Confirmed target hash does not match the prepared request.",
         )
-    run_dir = Path(request["run_dir"]).resolve(strict=False)
     store = RunStore(run_dir.parent)
+    _validate_request_binding(store, run_dir, path, request)
     current = now().astimezone(timezone.utc)
     try:
         expires_at = datetime.fromisoformat(request["expires_at"]).astimezone(
@@ -428,7 +503,10 @@ def execute_request(
             raise ExecutionBlockedError(
                 "request_not_prepared", "Execution request is no longer pending."
             ) from None
-        _cleanup_paths({"temp_dir": request["temp_dir"], "request_path": str(path)})
+        _cleanup_paths(
+            run_dir,
+            {"temp_dir": request["temp_dir"], "request_path": str(path)},
+        )
         raise ExecutionBlockedError("request_expired", "Execution request expired.")
 
     try:
@@ -525,11 +603,12 @@ def execute_request(
                     code="worker_failure",
                     label="Execution worker result",
                 )
-                status = (
-                    "completed_with_cell_errors"
-                    if worker.get("has_cell_errors")
-                    else "completed"
-                )
+                if worker.get("timed_out") is True:
+                    status = "timeout"
+                elif worker.get("has_cell_errors"):
+                    status = "completed_with_cell_errors"
+                else:
+                    status = "completed"
             else:
                 status = "worker_failure"
                 pending_error = ExecutionBlockedError(
@@ -586,7 +665,10 @@ def execute_request(
             pass
         raise
     finally:
-        _cleanup_paths({"temp_dir": request["temp_dir"], "request_path": str(path)})
+        _cleanup_paths(
+            run_dir,
+            {"temp_dir": request["temp_dir"], "request_path": str(path)},
+        )
     if pending_error is not None:
         raise pending_error
     return log_path

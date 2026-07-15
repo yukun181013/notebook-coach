@@ -98,7 +98,13 @@ def _string_list(value: Any, *, code: str, allow_empty: bool = False) -> list[st
     return value
 
 
-def _cell_indices(value: Any, *, cell_count: int, allow_empty: bool = False) -> list[int]:
+def _cell_indices(
+    value: Any,
+    *,
+    cell_count: int,
+    allow_empty: bool = False,
+    allowed_cell_indices: set[int] | None = None,
+) -> list[int]:
     if not isinstance(value, list) or (not value and not allow_empty):
         _fail("unknown_cell_index", "Issue cell indices are invalid.")
     if any(
@@ -106,6 +112,7 @@ def _cell_indices(value: Any, *, cell_count: int, allow_empty: bool = False) -> 
         or not isinstance(index, int)
         or index < 0
         or index >= cell_count
+        or (allowed_cell_indices is not None and index not in allowed_cell_indices)
         for index in value
     ):
         _fail("unknown_cell_index", "Issue references an unknown cell index.")
@@ -114,7 +121,12 @@ def _cell_indices(value: Any, *, cell_count: int, allow_empty: bool = False) -> 
     return value
 
 
-def _validate_issue(value: Any, *, cell_count: int) -> dict[str, Any]:
+def _validate_issue(
+    value: Any,
+    *,
+    cell_count: int,
+    allowed_cell_indices: set[int] | None = None,
+) -> dict[str, Any]:
     issue = _mapping(value, code="issue_contract", message="Issue must be an object.")
     _exact_keys(issue, _ISSUE_KEYS, code="issue_contract")
     issue_id = issue.get("issue_id")
@@ -125,7 +137,11 @@ def _validate_issue(value: Any, *, cell_count: int) -> dict[str, Any]:
     if issue.get("severity") not in SEVERITIES:
         _fail("unsupported_severity", "Issue severity is not supported.")
     _text(issue.get("category"), code="issue_contract")
-    _cell_indices(issue.get("cell_indices"), cell_count=cell_count)
+    _cell_indices(
+        issue.get("cell_indices"),
+        cell_count=cell_count,
+        allowed_cell_indices=allowed_cell_indices,
+    )
     for key in ("evidence", "impact", "recommendation"):
         _text(issue.get(key), code="issue_contract")
     return issue
@@ -136,6 +152,7 @@ def validate_diagnosis(
     *,
     run_id: str,
     cell_count: int,
+    allowed_cell_indices: set[int] | None = None,
 ) -> dict[str, Any]:
     """Validate diagnosis JSON without repairing or reordering it."""
 
@@ -157,7 +174,11 @@ def validate_diagnosis(
         _fail("issue_contract", "Diagnosis issues must be a list.")
     issue_ids: list[str] = []
     for issue in issues:
-        validated = _validate_issue(issue, cell_count=cell_count)
+        validated = _validate_issue(
+            issue,
+            cell_count=cell_count,
+            allowed_cell_indices=allowed_cell_indices,
+        )
         issue_ids.append(validated["issue_id"])
     if len(issue_ids) != len(set(issue_ids)):
         _fail("duplicate_issue_id", "Diagnosis issue IDs must be unique.")
@@ -205,6 +226,7 @@ def validate_verification(
     baseline_issue_ids: list[str],
     cell_count: int = 1_000_000,
     challenge_verifiable: bool = True,
+    allowed_cell_indices: set[int] | None = None,
 ) -> dict[str, Any]:
     verification = _mapping(
         value,
@@ -239,6 +261,7 @@ def validate_verification(
             result.get("current_cell_indices"),
             cell_count=cell_count,
             allow_empty=True,
+            allowed_cell_indices=allowed_cell_indices,
         )
         _text(result.get("evidence"), code="verification_contract")
     if sorted(result_ids) != sorted(baseline_issue_ids) or len(result_ids) != len(
@@ -251,7 +274,11 @@ def validate_verification(
         _fail("verification_contract", "New issues must be a list.")
     new_issue_ids: list[str] = []
     for issue in new_issues:
-        validated = _validate_issue(issue, cell_count=cell_count)
+        validated = _validate_issue(
+            issue,
+            cell_count=cell_count,
+            allowed_cell_indices=allowed_cell_indices,
+        )
         new_issue_ids.append(validated["issue_id"])
     if set(new_issue_ids).intersection(baseline_issue_ids):
         _fail("new_issue_ids", "New issue IDs collide with baseline issues.")

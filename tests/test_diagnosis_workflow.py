@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 
 import nbformat
@@ -13,6 +14,20 @@ from notebook_coach.workflows import finalize_diagnosis, prepare_diagnosis
 
 def _source_hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _kernel_processes() -> set[str]:
+    result = subprocess.run(
+        ["ps", "-axo", "pid=,command="],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    return {
+        line.strip()
+        for line in result.stdout.splitlines()
+        if "ipykernel_launcher" in line
+    }
 
 
 def test_prepare_diagnosis_creates_only_staging_inputs(
@@ -34,6 +49,7 @@ def test_static_flow_preserves_source_hash_with_checked_in_assessment(
     notebook_path: Path, tmp_path: Path
 ):
     before = _source_hash(notebook_path)
+    kernels_before = _kernel_processes()
     prepared = prepare_diagnosis(notebook_path, tmp_path / "runs")
     fixture_path = Path(__file__).parent / "fixtures/diagnosis-assessment.json"
     assessment = json.loads(fixture_path.read_text("utf-8"))
@@ -43,6 +59,7 @@ def test_static_flow_preserves_source_hash_with_checked_in_assessment(
     run_dir = finalize_diagnosis(prepared.stage.stage_dir)
 
     assert _source_hash(notebook_path) == before
+    assert _kernel_processes() == kernels_before
     assert run_dir == prepared.stage.final_dir
     assert not prepared.stage.stage_dir.exists()
     required = {
@@ -83,3 +100,18 @@ def test_invalid_assessment_leaves_stage_and_no_final_run(
     assert prepared.stage.stage_dir.is_dir()
     assert not prepared.stage.final_dir.exists()
 
+
+def test_selected_cell_diagnosis_rejects_issue_from_omitted_cell(
+    notebook_path: Path,
+    tmp_path: Path,
+    valid_diagnosis: dict,
+):
+    prepared = prepare_diagnosis(notebook_path, tmp_path / "runs", cells="1")
+    assessment = json.loads(json.dumps(valid_diagnosis))
+    assessment["run_id"] = prepared.stage.run_id
+    prepared.assessment_path.write_text(json.dumps(assessment), encoding="utf-8")
+
+    with pytest.raises(ContractError) as error:
+        finalize_diagnosis(prepared.stage.stage_dir)
+
+    assert error.value.code == "unknown_cell_index"

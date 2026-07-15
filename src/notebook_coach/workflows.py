@@ -174,10 +174,22 @@ def finalize_diagnosis(stage_dir: str | Path) -> Path:
             "source_hash_mismatch", "Stage and snapshot source hashes do not match."
         )
     cell_count = source.get("cell_count")
+    snapshot_cells = snapshot.get("cells")
+    if not isinstance(snapshot_cells, list) or any(
+        not isinstance(cell, dict)
+        or isinstance(cell.get("index"), bool)
+        or not isinstance(cell.get("index"), int)
+        for cell in snapshot_cells
+    ):
+        raise WorkflowError("snapshot_invalid", "Snapshot cells are invalid.")
+    allowed_cell_indices = {cell["index"] for cell in snapshot_cells}
+    if len(allowed_cell_indices) != len(snapshot_cells):
+        raise WorkflowError("snapshot_invalid", "Snapshot cells are invalid.")
     assessment = validate_diagnosis(
         assessment_value,
         run_id=stage.run_id,
         cell_count=cell_count,
+        allowed_cell_indices=allowed_cell_indices,
     )
     baseline = build_baseline(snapshot, assessment, source_path=stage.source_path)
     report_state = build_report_state(baseline)
@@ -205,6 +217,139 @@ def _analysis_id(baseline: dict[str, Any]) -> str:
         unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     return hashlib.sha256(body).hexdigest()
+
+
+def _verification_assessment_id(
+    *,
+    run_id: str,
+    source_sha256: Any,
+    challenge_sha256: Any,
+    assessment: dict[str, Any],
+) -> str:
+    identity = {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": run_id,
+        "source_sha256": source_sha256,
+        "challenge_sha256": challenge_sha256,
+        "assessment": assessment,
+    }
+    return hashlib.sha256(_json_bytes(identity).rstrip(b"\n")).hexdigest()
+
+
+def _validate_verification_artifacts(
+    directory: Path, baseline: dict[str, Any]
+) -> None:
+    report_path = directory / "verification.md"
+    state_path = directory / ".notebook-coach/verification-state.json"
+    if report_path.is_file() != state_path.is_file():
+        raise WorkflowError(
+            "verification_artifact_pair",
+            "Verification report and state must either both exist or both be absent.",
+        )
+    if not report_path.is_file():
+        return
+
+    state = _read_json_object(
+        state_path,
+        code="verification_state_invalid",
+        label="Verification state",
+    )
+    expected_keys = {
+        "schema_version",
+        "run_id",
+        "source_target",
+        "challenge_target",
+        "challenge_verifiability",
+        "assessment",
+        "before_score",
+        "after_score",
+        "assessment_id",
+        "revision",
+        "execution_reviews",
+    }
+    source_target = state.get("source_target")
+    challenge_target = state.get("challenge_target")
+    verifiability = state.get("challenge_verifiability")
+    baseline_issues = baseline.get("issues")
+    baseline_source = baseline.get("source")
+    revision = state.get("revision")
+    reviews = state.get("execution_reviews")
+    if (
+        set(state) != expected_keys
+        or state.get("schema_version") != SCHEMA_VERSION
+        or state.get("run_id") != baseline.get("run_id")
+        or not isinstance(source_target, dict)
+        or not isinstance(challenge_target, dict)
+        or not isinstance(verifiability, dict)
+        or not isinstance(verifiability.get("verifiable"), bool)
+        or not isinstance(baseline_issues, list)
+        or not isinstance(baseline_source, dict)
+        or isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision < 1
+        or not isinstance(reviews, list)
+        or revision != len(reviews) + 1
+    ):
+        raise WorkflowError(
+            "verification_state_invalid", "Verification state is invalid."
+        )
+    cell_count = source_target.get("cell_count", baseline_source.get("cell_count"))
+    if (
+        isinstance(cell_count, bool)
+        or not isinstance(cell_count, int)
+        or cell_count < 0
+    ):
+        raise WorkflowError(
+            "verification_state_invalid", "Verification state is invalid."
+        )
+    try:
+        assessment = validate_verification(
+            state.get("assessment"),
+            run_id=baseline["run_id"],
+            baseline_issue_ids=[item["issue_id"] for item in baseline_issues],
+            cell_count=cell_count,
+            challenge_verifiable=verifiability["verifiable"],
+        )
+        after_score = score_verification(
+            baseline_issues,
+            assessment["issue_results"],
+            assessment["new_issues"],
+        )
+    except (ContractError, KeyError, TypeError, ValueError):
+        raise WorkflowError(
+            "verification_state_invalid", "Verification state is invalid."
+        ) from None
+    if state.get("before_score") != baseline.get("score") or state.get(
+        "after_score"
+    ) != after_score:
+        raise WorkflowError(
+            "verification_score_mismatch",
+            "Verification score arithmetic is invalid.",
+        )
+    expected_assessment_id = _verification_assessment_id(
+        run_id=baseline["run_id"],
+        source_sha256=source_target.get("sha256"),
+        challenge_sha256=challenge_target.get("sha256"),
+        assessment=assessment,
+    )
+    if state.get("assessment_id") != expected_assessment_id:
+        raise WorkflowError(
+            "verification_assessment_id_mismatch",
+            "Verification assessment ID is invalid.",
+        )
+    try:
+        actual_report = report_path.read_text("utf-8")
+        expected_report = render_verification(state)
+    except (OSError, UnicodeError, KeyError, TypeError, ValueError):
+        raise WorkflowError(
+            "verification_report_invalid",
+            "Verification report cannot be regenerated.",
+        ) from None
+    if actual_report != expected_report:
+        raise WorkflowError(
+            "verification_report_mismatch",
+            "Verification report does not match its structured state.",
+        )
 
 
 def validate_run(run_dir: str | Path) -> Path:
@@ -292,6 +437,7 @@ def validate_run(run_dir: str | Path) -> Path:
         or not isinstance(ledger.get("entries"), list)
     ):
         raise WorkflowError("ledger_invalid", "Execution ledger is invalid.")
+    _validate_verification_artifacts(directory, baseline)
     return directory
 
 
@@ -305,12 +451,13 @@ def _file_sha256(path: Path) -> str:
 def _challenge_snapshot(
     challenge_path: Path, baseline: dict[str, Any]
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    target_sha256 = _file_sha256(challenge_path)
+    target_sha256: str | None = None
     reason: str | None = None
     safe_cells: list[dict[str, Any]] = []
     initial_hashes: dict[str, str] = {}
     current_hashes: dict[str, str] = {}
     try:
+        target_sha256 = _file_sha256(challenge_path)
         notebook = nbformat.read(challenge_path, as_version=4)
         metadata = notebook.metadata.get("notebook_coach", {})
         expected_ids = [item["challenge_id"] for item in baseline["challenges"]]
@@ -441,6 +588,7 @@ def prepare_verification(
             "sha256": current_source["sha256"],
             "kernel_name": current_kernel,
             "language": current_language,
+            "cell_count": current_source["cell_count"],
         },
         "challenge_target": {
             "path": str(challenge_path.resolve()),
@@ -543,11 +691,16 @@ def finalize_verification(
         for value in (source_target, challenge_target, verifiability)
     ):
         raise WorkflowError("verification_stage_invalid", "Stage targets are invalid.")
-    if (
+    source_changed = (
         _file_sha256(Path(source_target["path"])) != source_target["sha256"]
-        or _file_sha256(Path(challenge_target["path"]))
-        != challenge_target["sha256"]
-    ):
+    )
+    challenge_changed = False
+    if verifiability.get("verifiable"):
+        challenge_changed = (
+            _file_sha256(Path(challenge_target["path"]))
+            != challenge_target["sha256"]
+        )
+    if source_changed or challenge_changed:
         raise WorkflowError(
             "analysis_target_changed", "Verification target changed after staging."
         )
@@ -560,19 +713,20 @@ def finalize_verification(
         baseline_issue_ids=[item["issue_id"] for item in baseline_issues],
         cell_count=source_snapshot["source"]["cell_count"],
         challenge_verifiable=bool(verifiability["verifiable"]),
+        allowed_cell_indices={
+            cell["index"] for cell in source_snapshot["cells"]
+        },
     )
     before_score = baseline["score"]
     after_score = score_verification(
         baseline_issues, assessment["issue_results"], assessment["new_issues"]
     )
-    identity = {
-        "schema_version": SCHEMA_VERSION,
-        "run_id": metadata["run_id"],
-        "source_sha256": source_target["sha256"],
-        "challenge_sha256": challenge_target["sha256"],
-        "assessment": assessment,
-    }
-    assessment_id = hashlib.sha256(_json_bytes(identity).rstrip(b"\n")).hexdigest()
+    assessment_id = _verification_assessment_id(
+        run_id=metadata["run_id"],
+        source_sha256=source_target["sha256"],
+        challenge_sha256=challenge_target["sha256"],
+        assessment=assessment,
+    )
     state = {
         "schema_version": SCHEMA_VERSION,
         "run_id": metadata["run_id"],

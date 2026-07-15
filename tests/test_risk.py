@@ -1055,6 +1055,19 @@ def test_path_tracking_does_not_flag_arbitrary_same_named_methods(
         ("%pip install example", {"package_install"}),
         ("!pip install example", {"shell", "package_install"}),
         ("%conda install example", {"package_install"}),
+        ("%run /tmp/unreviewed.py", {"shell"}),
+        ("%sx curl https://example.com", {"shell"}),
+        ("%system curl https://example.com", {"shell"}),
+        ("%%script bash\necho hello", {"shell"}),
+        ('get_ipython().system("curl https://example.com")', {"shell"}),
+        (
+            'get_ipython().run_line_magic("run", "/tmp/unreviewed.py")',
+            {"shell"},
+        ),
+        (
+            'get_ipython().run_cell_magic("script", "bash", "echo hello")',
+            {"shell"},
+        ),
     ],
 )
 def test_shell_and_package_magics_are_high_risk(

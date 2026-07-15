@@ -255,6 +255,49 @@ def test_cross_target_or_replayed_review_is_rejected(
     assert replay.value.code == "execution_log_replayed"
 
 
+def test_verification_review_rejects_new_issue_outside_source_cells(
+    notebook_path: Path,
+    tmp_path: Path,
+    valid_diagnosis: dict,
+    valid_verification: dict,
+):
+    run_dir = _run(notebook_path, tmp_path / "runs", valid_diagnosis)
+    _verification(
+        run_dir, notebook_path, valid_verification, statuses=("remaining", "remaining")
+    )
+    state = json.loads(
+        (run_dir / ".notebook-coach/verification-state.json").read_text("utf-8")
+    )
+    log_path = _write_log(
+        run_dir, phase="verification", target="source", attempt_id="A001"
+    )
+    review_path = _write_review(
+        tmp_path / "review.json",
+        run_id=state["run_id"],
+        phase="verification",
+        target="source",
+        attempt_id="A001",
+        execution_log=log_path.name,
+        new_issues=[
+            {
+                "issue_id": "I003",
+                "dimension": "correctness",
+                "severity": "major",
+                "category": "code",
+                "cell_indices": [999999],
+                "evidence": "The new issue is outside the analyzed notebook.",
+                "impact": "Evidence cannot support this issue.",
+                "recommendation": "Reference an existing source cell.",
+            }
+        ],
+    )
+
+    with pytest.raises(RevisionError) as error:
+        apply_execution_review(run_dir, log_path, review_path)
+
+    assert error.value.code == "unknown_cell_index"
+
+
 def test_unverifiable_challenge_rejects_review_before_reading_log(
     notebook_path: Path,
     tmp_path: Path,

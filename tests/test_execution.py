@@ -317,6 +317,36 @@ def test_total_timeout_terminates_worker_and_cleans_temp_under_five_seconds(
     assert not Path(prepared.request["temp_dir"]).exists()
 
 
+def test_cell_timeout_is_eligible_and_preserves_completed_cell_evidence(
+    notebook_factory, tmp_path: Path, valid_diagnosis: dict
+):
+    source = notebook_factory(
+        cells=[
+            nbformat.v4.new_code_cell("print('completed-step')"),
+            nbformat.v4.new_code_cell("while True:\n    pass"),
+        ]
+    )
+    run_dir = _finalized_run(source, tmp_path / "runs", valid_diagnosis)
+    prepared = prepare_execution(
+        run_dir,
+        phase="diagnosis",
+        target="source",
+        cell_timeout=1,
+        total_timeout=12,
+    )
+
+    log_path = execute_request(
+        prepared.request_path, prepared.request["target_sha256"]
+    )
+    log = json.loads(log_path.read_text("utf-8"))
+
+    assert log["status"] == "timeout"
+    assert log["evidence_eligible"] is True
+    assert log["worker"]["timed_out"] is True
+    assert log["worker"]["timeout_cell_index"] == 1
+    assert "completed-step" in log_path.read_text("utf-8")
+
+
 def test_execution_log_redacts_and_bounds_notebook_output(
     notebook_factory, tmp_path: Path, valid_diagnosis: dict
 ):
@@ -340,3 +370,41 @@ def test_execution_log_redacts_and_bounds_notebook_output(
     assert secret not in body
     assert "[REDACTED]" in body
     assert len(body) < 20_000
+
+
+def test_tampered_reserved_paths_are_rejected_without_deleting_unrelated_dirs(
+    notebook_path: Path, tmp_path: Path, valid_diagnosis: dict
+):
+    run_dir = _finalized_run(notebook_path, tmp_path / "runs", valid_diagnosis)
+    victim = tmp_path / "unrelated-empty-directory"
+    victim.mkdir()
+    prepared = prepare_execution(run_dir, phase="diagnosis", target="source")
+    request = json.loads(prepared.request_path.read_text("utf-8"))
+    request["temp_dir"] = str(victim)
+    prepared.request_path.write_text(json.dumps(request), encoding="utf-8")
+
+    with pytest.raises(ExecutionBlockedError) as error:
+        execute_request(prepared.request_path, prepared.request["target_sha256"])
+
+    assert error.value.code == "request_binding_mismatch"
+    assert victim.is_dir()
+    assert _ledger(run_dir)["entries"][0]["status"] == "prepared"
+
+
+def test_cancel_rejects_tampered_request_before_cleanup(
+    notebook_path: Path, tmp_path: Path, valid_diagnosis: dict
+):
+    run_dir = _finalized_run(notebook_path, tmp_path / "runs", valid_diagnosis)
+    victim = tmp_path / "unrelated-empty-directory"
+    victim.mkdir()
+    prepared = prepare_execution(run_dir, phase="diagnosis", target="source")
+    request = json.loads(prepared.request_path.read_text("utf-8"))
+    request["temp_dir"] = str(victim)
+    prepared.request_path.write_text(json.dumps(request), encoding="utf-8")
+
+    with pytest.raises(ExecutionBlockedError) as error:
+        cancel_execution(prepared.request_path)
+
+    assert error.value.code == "request_binding_mismatch"
+    assert victim.is_dir()
+    assert _ledger(run_dir)["entries"][0]["status"] == "prepared"

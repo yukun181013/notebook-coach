@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import re
@@ -94,7 +95,7 @@ def _evidence_fields(value: Any, expected: set[str]) -> dict[str, Any]:
     return value
 
 
-def _validate_new_issue(value: Any) -> dict[str, Any]:
+def _validate_new_issue(value: Any, *, cell_count: int) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != _ISSUE_KEYS:
         raise RevisionError("review_contract", "New issue fields are invalid.")
     issue_id = value.get("issue_id")
@@ -107,16 +108,27 @@ def _validate_new_issue(value: Any) -> dict[str, Any]:
         not isinstance(indices, list)
         or not indices
         or indices != sorted(set(indices))
-        or any(isinstance(index, bool) or not isinstance(index, int) or index < 0 for index in indices)
+        or any(
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or index < 0
+            or index >= cell_count
+            for index in indices
+        )
     ):
-        raise RevisionError("review_contract", "New issue cell indices are invalid.")
+        raise RevisionError("unknown_cell_index", "New issue cell indices are invalid.")
     for key in ("category", "evidence", "impact", "recommendation"):
         _safe_text(value.get(key))
     return value
 
 
 def _validate_review(
-    value: dict[str, Any], *, phase: str, target: str, baseline_issue_ids: set[str]
+    value: dict[str, Any],
+    *,
+    phase: str,
+    target: str,
+    baseline_issue_ids: set[str],
+    cell_count: int,
 ) -> dict[str, Any]:
     if set(value) != _REVIEW_KEYS or value.get("schema_version") != SCHEMA_VERSION:
         raise RevisionError("review_contract", "Execution review contract is invalid.")
@@ -150,7 +162,7 @@ def _validate_review(
                 raise RevisionError("unknown_issue", "Source review issue ID is invalid.")
             seen.add(update["issue_id"])
         for issue in value["new_issues"]:
-            _validate_new_issue(issue)
+            _validate_new_issue(issue, cell_count=cell_count)
     elif target == "challenge":
         if value["issue_updates"] or value["new_issues"] or len(value["challenge_updates"]) != 1:
             raise RevisionError("target_boundary", "Challenge review crossed its target boundary.")
@@ -173,6 +185,17 @@ def _json_bytes(value: Any) -> bytes:
         json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         + "\n"
     ).encode("utf-8")
+
+
+def _assessment_id(state: dict[str, Any]) -> str:
+    identity = {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": state["run_id"],
+        "source_sha256": state["source_target"]["sha256"],
+        "challenge_sha256": state["challenge_target"]["sha256"],
+        "assessment": state["assessment"],
+    }
+    return hashlib.sha256(_json_bytes(identity).rstrip(b"\n")).hexdigest()
 
 
 def _replace_pair(
@@ -253,12 +276,31 @@ def apply_execution_review(
         report_path = directory / "verification.md"
         target_state = state.get(f"{target}_target", {})
         analysis_id = state.get("assessment_id")
+        cell_count = state.get("source_target", {}).get("cell_count")
+        if (
+            isinstance(cell_count, bool)
+            or not isinstance(cell_count, int)
+            or cell_count < 0
+        ):
+            raise RevisionError(
+                "verification_state_invalid",
+                "Verification source cell count is invalid.",
+            )
     else:
         state_path = directory / ".notebook-coach/report-state.json"
         state = _read_object(state_path, code="report_state_invalid", label="Report state")
         report_path = directory / "report.md"
         target_state = baseline.get("source", {})
         analysis_id = baseline.get("analysis_id")
+        cell_count = baseline.get("source", {}).get("cell_count")
+        if (
+            isinstance(cell_count, bool)
+            or not isinstance(cell_count, int)
+            or cell_count < 0
+        ):
+            raise RevisionError(
+                "baseline_invalid", "Baseline source cell count is invalid."
+            )
 
     previous_reviews = state.get("execution_reviews")
     if not isinstance(previous_reviews, list):
@@ -283,7 +325,11 @@ def apply_execution_review(
         if review.get(key) != expected[key]:
             raise RevisionError("review_binding_mismatch", "Execution review binding is invalid.")
     review = _validate_review(
-        review, phase=phase, target=target, baseline_issue_ids=baseline_issue_ids
+        review,
+        phase=phase,
+        target=target,
+        baseline_issue_ids=baseline_issue_ids,
+        cell_count=cell_count,
     )
 
     updated = copy.deepcopy(state)
@@ -308,6 +354,7 @@ def apply_execution_review(
                 challenge_verifiable=bool(
                     updated["challenge_verifiability"]["verifiable"]
                 ),
+                cell_count=cell_count,
             )
             updated["after_score"] = score_verification(
                 baseline["issues"],
@@ -323,6 +370,7 @@ def apply_execution_review(
             )
             result["status"] = change["status"]
             result["evidence"] = change["evidence"]
+        updated["assessment_id"] = _assessment_id(updated)
         report = render_verification(updated)
 
     _replace_pair(

@@ -77,6 +77,31 @@ def test_skill_uses_only_staging_paths_and_never_fabricates_evidence():
     assert "not an OS sandbox" in text
 
 
+def test_skill_links_complete_contract_reference_and_cli_review_path():
+    text = _skill_text()
+    contract_path = ROOT / "references/contracts.md"
+
+    assert "references/contracts.md" in text
+    assert "review_path" in text
+    assert contract_path.is_file()
+    contracts = contract_path.read_text("utf-8")
+    for section in (
+        "Diagnosis assessment",
+        "Verification assessment",
+        "Execution review",
+    ):
+        assert section in contracts
+    for field in (
+        "notebook_summary",
+        "concept_map",
+        "issue_results",
+        "challenge_results",
+        "execution_log",
+        "evidence_label",
+    ):
+        assert field in contracts
+
+
 def test_openai_display_metadata_matches_skill():
     text = (ROOT / "agents/openai.yaml").read_text("utf-8")
     assert 'display_name: "Notebook Coach"' in text
@@ -85,4 +110,3 @@ def test_openai_display_metadata_matches_skill():
         in text
     )
     assert "$notebook-coach" in text
-
