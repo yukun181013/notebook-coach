@@ -70,6 +70,93 @@ def test_redacts_entire_unquoted_sensitive_value_with_punctuation():
     assert labels == ["sensitive_assignment"]
 
 
+@pytest.mark.parametrize(
+    ("text", "expected", "secret_fragments"),
+    [
+        (
+            "password=correct horse battery staple",
+            "password=[REDACTED]",
+            ("correct", "horse", "battery", "staple"),
+        ),
+        (
+            "password=[secret_value]",
+            "password=[REDACTED]",
+            ("secret_value",),
+        ),
+        (
+            'password=["alpha", "beta"]\nvisible = "safe"',
+            'password=[REDACTED]\nvisible = "safe"',
+            ("alpha", "beta"),
+        ),
+    ],
+)
+def test_redacts_complete_equals_rhs_without_crossing_lines(
+    text, expected, secret_fragments
+):
+    cleaned, labels = redact_text(text)
+
+    assert cleaned == expected
+    assert all(fragment not in repr((cleaned, labels)) for fragment in secret_fragments)
+    assert labels == ["sensitive_assignment"]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected", "secret_fragments"),
+    [
+        (
+            "password=correct horse battery staple",
+            "password=[REDACTED]",
+            ("correct", "horse", "battery", "staple"),
+        ),
+        (
+            "password=[secret_value]",
+            "password=[REDACTED]",
+            ("secret_value",),
+        ),
+        (
+            'password=["alpha", "beta"]\nvisible = "safe"',
+            'password=[REDACTED]\nvisible = "safe"',
+            ("alpha", "beta"),
+        ),
+    ],
+)
+def test_summarize_text_redacts_complete_equals_rhs(
+    text, expected, secret_fragments
+):
+    result = summarize_text(text)
+
+    assert result["text"] == expected
+    assert all(fragment not in repr(result) for fragment in secret_fragments)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected", "secret"),
+    [
+        (
+            "call(password=secret_value)",
+            "call(password=[REDACTED])",
+            "secret_value",
+        ),
+        (
+            'password=secret; print("safe")',
+            'password=[REDACTED]; print("safe")',
+            "secret",
+        ),
+        (
+            "call(password=secret_value, retries=3)",
+            "call(password=[REDACTED], retries=3)",
+            "secret_value",
+        ),
+    ],
+)
+def test_redacts_equals_rhs_and_preserves_following_structure(text, expected, secret):
+    cleaned, labels = redact_text(text)
+
+    assert cleaned == expected
+    assert secret not in repr((cleaned, labels))
+    assert labels == ["sensitive_assignment"]
+
+
 def test_redacts_python_annotated_sensitive_assignment_rhs():
     secret = "synthetic-secret-value"
 
@@ -78,6 +165,29 @@ def test_redacts_python_annotated_sensitive_assignment_rhs():
     assert cleaned == 'api_key: str = "[REDACTED]"'
     assert secret not in repr((cleaned, labels))
     assert labels == ["sensitive_assignment"]
+
+
+def test_redacts_python_annotated_assignment_without_spaces_around_equals():
+    secret = "synthetic-secret-value"
+
+    cleaned, labels = redact_text(f'api_key: str="{secret}"')
+
+    assert cleaned == 'api_key: str="[REDACTED]"'
+    assert secret not in repr((cleaned, labels))
+    assert labels == ["sensitive_assignment"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "api_key: str",
+        "api_key: Optional[str]",
+        "def connect(api_key: str): ...",
+    ],
+)
+def test_does_not_redact_python_type_annotations_without_assignments(text):
+    assert redact_text(text) == (text, [])
+    assert summarize_text(text)["text"] == text
 
 
 def test_redacts_entire_yaml_sensitive_assignment_value():

@@ -42,59 +42,45 @@ _SENSITIVE_NAME_PATTERN = (
     r"[A-Za-z0-9_.-]*"
 )
 
-_SENSITIVE_ASSIGNMENT = re.compile(
+_SENSITIVE_TARGET = re.compile(
     rf"""
-    (?P<target>
-        (?:
-            (?P<key_quote>["']?)
-            (?P<simple_name>{_SENSITIVE_NAME_PATTERN})
-            (?P=key_quote)
-        )
-        |
-        (?:
+    (?:
+        (?P<subscript>
             [A-Za-z_][A-Za-z0-9_.]*[ \t]*\[[ \t]*
             (?P<subscript_quote>["'])
             (?P<subscript_name>{_SENSITIVE_NAME_PATTERN})
             (?P=subscript_quote)
             [ \t]*\]
         )
-    )
-    (?:
-        (?P<typed_separator>
-            [ \t]*:[ \t]*
-            [A-Za-z_][A-Za-z0-9_.]*(?:\[[^=\r\n]*\])?
-            (?:[ \t]*\|[ \t]*[A-Za-z_][A-Za-z0-9_.]*)*
-            [ \t]+=[ \t]*
-        )
-        (?:
-            "(?P<typed_double>(?:\\.|[^"\\\r\n])*)"
-            |
-            '(?P<typed_single>(?:\\.|[^'\\\r\n])*)'
-            |
-            (?P<typed_bare>\[REDACTED\]|[^\s,}}\]\[]+)
-        )
         |
-        (?P<equals_separator>[ \t]*=[ \t]*)
-        (?:
-            "(?P<equals_double>(?:\\.|[^"\\\r\n])*)"
-            |
-            '(?P<equals_single>(?:\\.|[^'\\\r\n])*)'
-            |
-            (?P<equals_bare>\[REDACTED\]|[^\s,}}\]\[]+)
+        (?P<simple>
+            (?P<key_quote>["']?)
+            (?P<simple_name>{_SENSITIVE_NAME_PATTERN})
+            (?P=key_quote)
         )
-        |
-        (?P<colon_separator>[ \t]*:[ \t]*)
-        (?:
-            "(?P<colon_double>(?:\\.|[^"\\\r\n])*)"
-            |
-            '(?P<colon_single>(?:\\.|[^'\\\r\n])*)'
-            |
-            (?P<colon_bare>[^\r\n,]*?[^\s,\r\n])
-        )
-        (?P<colon_suffix>[ \t]*)(?=,|[\x7d\]]|\r?$)
     )
     """,
-    re.IGNORECASE | re.MULTILINE | re.VERBOSE,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+_PYTHON_TYPE_ATOM_PATTERN = (
+    r"(?:"
+    r"str|bytes|int|float|bool|complex|object|None|Any"
+    r"|list|dict|tuple|set|frozenset"
+    r"|(?:typing\.)?[A-Z][A-Za-z0-9_.]*"
+    r")"
+    r"(?:[ \t]*\[[^=\r\n]*\])?"
+)
+
+_PYTHON_ANNOTATION = re.compile(
+    rf"""
+    [ \t]*
+    {_PYTHON_TYPE_ATOM_PATTERN}
+    (?:[ \t]*\|[ \t]*{_PYTHON_TYPE_ATOM_PATTERN})*
+    [ \t]*
+    (?P<terminator>=|[,):#]|$)
+    """,
+    re.VERBOSE,
 )
 
 
@@ -123,37 +109,150 @@ def _is_sensitive_assignment(name: str, value: str) -> bool:
     return True
 
 
-def _redact_sensitive_assignments(text: str) -> tuple[str, bool]:
+def _skip_horizontal_space(line: str, start: int) -> int:
+    while start < len(line) and line[start] in " \t":
+        start += 1
+    return start
+
+
+def _assignment_value_start(line: str, target_end: int) -> int | None:
+    separator = _skip_horizontal_space(line, target_end)
+    if separator >= len(line):
+        return None
+
+    if line[separator] == "=":
+        return _skip_horizontal_space(line, separator + 1)
+    if line[separator] != ":":
+        return None
+
+    annotation = _PYTHON_ANNOTATION.match(line, separator + 1)
+    if annotation is None:
+        return _skip_horizontal_space(line, separator + 1)
+    if annotation.group("terminator") != "=":
+        return None
+    return _skip_horizontal_space(line, annotation.end())
+
+
+def _scan_quoted_value(line: str, start: int) -> tuple[int, int, str]:
+    quote = line[start]
+    cursor = start + 1
+    while cursor < len(line):
+        if line[cursor] == "\\" and cursor + 1 < len(line):
+            cursor += 2
+            continue
+        if line[cursor] == quote:
+            return start + 1, cursor, line[start + 1 : cursor]
+        cursor += 1
+    return start + 1, len(line), line[start + 1 :]
+
+
+def _scan_container_value(line: str, start: int) -> tuple[int, int, str]:
+    closing_for = {"[": "]", "{": "}", "(": ")"}
+    stack = [closing_for[line[start]]]
+    cursor = start + 1
+    quote: str | None = None
+
+    while cursor < len(line):
+        character = line[cursor]
+        if quote is not None:
+            if character == "\\" and cursor + 1 < len(line):
+                cursor += 2
+                continue
+            if character == quote:
+                quote = None
+        elif character in "\"'":
+            quote = character
+        elif character in closing_for:
+            stack.append(closing_for[character])
+        elif character == stack[-1]:
+            stack.pop()
+            if not stack:
+                return start, cursor + 1, line[start : cursor + 1]
+        cursor += 1
+
+    return start, len(line), line[start:]
+
+
+def _scan_bare_value(line: str, start: int) -> tuple[int, int, str] | None:
+    cursor = start
+    while cursor < len(line):
+        character = line[cursor]
+        if character in ",)}]":
+            break
+        if character == ";" and (
+            cursor + 1 == len(line) or line[cursor + 1].isspace()
+        ):
+            break
+        cursor += 1
+
+    end = cursor
+    while end > start and line[end - 1] in " \t":
+        end -= 1
+    if end == start:
+        return None
+    return start, end, line[start:end]
+
+
+def _scan_assignment_value(line: str, start: int) -> tuple[int, int, str] | None:
+    if start >= len(line):
+        return None
+    if line[start] in "\"'":
+        return _scan_quoted_value(line, start)
+    if line[start] in "[{(":
+        return _scan_container_value(line, start)
+    return _scan_bare_value(line, start)
+
+
+def _redact_assignment_line(line: str) -> tuple[str, bool]:
+    output: list[str] = []
+    copied_until = 0
+    search_from = 0
     replaced = False
 
-    def replacement(match: re.Match[str]) -> str:
-        nonlocal replaced
+    while target := _SENSITIVE_TARGET.search(line, search_from):
+        value_start = _assignment_value_start(line, target.end())
+        if value_start is None:
+            search_from = target.end()
+            continue
 
-        name = match.group("simple_name") or match.group("subscript_name")
-        for style in ("typed", "equals", "colon"):
-            separator = match.group(f"{style}_separator")
-            if separator is None:
-                continue
+        value = _scan_assignment_value(line, value_start)
+        if value is None:
+            search_from = max(target.end(), value_start + 1)
+            continue
 
-            double_value = match.group(f"{style}_double")
-            single_value = match.group(f"{style}_single")
-            bare_value = match.group(f"{style}_bare")
-            value = next(
-                candidate
-                for candidate in (double_value, single_value, bare_value)
-                if candidate is not None
-            )
-            if not _is_sensitive_assignment(name, value):
-                return match.group(0)
+        replace_start, replace_end, original_value = value
+        name = target.group("simple_name") or target.group("subscript_name")
+        if not _is_sensitive_assignment(name, original_value):
+            search_from = max(target.end(), replace_end)
+            continue
 
-            replaced = True
-            quote = '"' if double_value is not None else "'" if single_value is not None else ""
-            suffix = match.group("colon_suffix") or ""
-            return f"{match.group('target')}{separator}{quote}{_REDACTED}{quote}{suffix}"
+        output.append(line[copied_until:replace_start])
+        output.append(_REDACTED)
+        copied_until = replace_end
+        search_from = replace_end
+        replaced = True
 
-        return match.group(0)
+    output.append(line[copied_until:])
+    return "".join(output), replaced
 
-    return _SENSITIVE_ASSIGNMENT.sub(replacement, text), replaced
+
+def _redact_sensitive_assignments(text: str) -> tuple[str, bool]:
+    cleaned_lines: list[str] = []
+    replaced = False
+
+    for line in text.splitlines(keepends=True):
+        if line.endswith("\r\n"):
+            body, ending = line[:-2], "\r\n"
+        elif line.endswith(("\r", "\n")):
+            body, ending = line[:-1], line[-1]
+        else:
+            body, ending = line, ""
+
+        cleaned, line_replaced = _redact_assignment_line(body)
+        cleaned_lines.append(cleaned + ending)
+        replaced = replaced or line_replaced
+
+    return "".join(cleaned_lines), replaced
 
 
 def redact_text(text: str) -> tuple[str, list[str]]:
