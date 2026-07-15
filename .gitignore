@@ -1,1 +1,9 @@
 .worktrees/
+.venv/
+.acceptance-venv/
+artifacts/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+notebook-coach-output/
+dist/
