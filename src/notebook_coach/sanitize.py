@@ -36,27 +36,65 @@ _NAMED_PATTERNS = (
     ),
 )
 
+_SENSITIVE_NAME_PATTERN = (
+    r"[A-Za-z0-9_.-]*"
+    r"(?:api[_-]?key|token|password|secret)"
+    r"[A-Za-z0-9_.-]*"
+)
+
 _SENSITIVE_ASSIGNMENT = re.compile(
-    r"""
-    (?P<prefix>
-        (?P<key_quote>["']?)
-        (?P<name>
-            [A-Za-z0-9_.-]*
-            (?:api[_-]?key|token|password|secret)
-            [A-Za-z0-9_.-]*
+    rf"""
+    (?P<target>
+        (?:
+            (?P<key_quote>["']?)
+            (?P<simple_name>{_SENSITIVE_NAME_PATTERN})
+            (?P=key_quote)
         )
-        (?P=key_quote)
-        \s*(?:=|:)\s*
+        |
+        (?:
+            [A-Za-z_][A-Za-z0-9_.]*[ \t]*\[[ \t]*
+            (?P<subscript_quote>["'])
+            (?P<subscript_name>{_SENSITIVE_NAME_PATTERN})
+            (?P=subscript_quote)
+            [ \t]*\]
+        )
     )
     (?:
-        "(?P<double_value>(?:\\.|[^"\\\r\n])*)"
+        (?P<typed_separator>
+            [ \t]*:[ \t]*
+            [A-Za-z_][A-Za-z0-9_.]*(?:\[[^=\r\n]*\])?
+            (?:[ \t]*\|[ \t]*[A-Za-z_][A-Za-z0-9_.]*)*
+            [ \t]+=[ \t]*
+        )
+        (?:
+            "(?P<typed_double>(?:\\.|[^"\\\r\n])*)"
+            |
+            '(?P<typed_single>(?:\\.|[^'\\\r\n])*)'
+            |
+            (?P<typed_bare>\[REDACTED\]|[^\s,}}\]\[]+)
+        )
         |
-        '(?P<single_value>(?:\\.|[^'\\\r\n])*)'
+        (?P<equals_separator>[ \t]*=[ \t]*)
+        (?:
+            "(?P<equals_double>(?:\\.|[^"\\\r\n])*)"
+            |
+            '(?P<equals_single>(?:\\.|[^'\\\r\n])*)'
+            |
+            (?P<equals_bare>\[REDACTED\]|[^\s,}}\]\[]+)
+        )
         |
-        (?P<bare_value>\[REDACTED\]|[^\s,}\]\[]+)
+        (?P<colon_separator>[ \t]*:[ \t]*)
+        (?:
+            "(?P<colon_double>(?:\\.|[^"\\\r\n])*)"
+            |
+            '(?P<colon_single>(?:\\.|[^'\\\r\n])*)'
+            |
+            (?P<colon_bare>[^\r\n,]*?[^\s,\r\n])
+        )
+        (?P<colon_suffix>[ \t]*)(?=,|\r?$)
     )
     """,
-    re.IGNORECASE | re.VERBOSE,
+    re.IGNORECASE | re.MULTILINE | re.VERBOSE,
 )
 
 
@@ -91,24 +129,29 @@ def _redact_sensitive_assignments(text: str) -> tuple[str, bool]:
     def replacement(match: re.Match[str]) -> str:
         nonlocal replaced
 
-        value = next(
-            candidate
-            for candidate in (
-                match.group("double_value"),
-                match.group("single_value"),
-                match.group("bare_value"),
-            )
-            if candidate is not None
-        )
-        if not _is_sensitive_assignment(match.group("name"), value):
-            return match.group(0)
+        name = match.group("simple_name") or match.group("subscript_name")
+        for style in ("typed", "equals", "colon"):
+            separator = match.group(f"{style}_separator")
+            if separator is None:
+                continue
 
-        replaced = True
-        if match.group("double_value") is not None:
-            return f'{match.group("prefix")}"{_REDACTED}"'
-        if match.group("single_value") is not None:
-            return f"{match.group('prefix')}'{_REDACTED}'"
-        return f"{match.group('prefix')}{_REDACTED}"
+            double_value = match.group(f"{style}_double")
+            single_value = match.group(f"{style}_single")
+            bare_value = match.group(f"{style}_bare")
+            value = next(
+                candidate
+                for candidate in (double_value, single_value, bare_value)
+                if candidate is not None
+            )
+            if not _is_sensitive_assignment(name, value):
+                return match.group(0)
+
+            replaced = True
+            quote = '"' if double_value is not None else "'" if single_value is not None else ""
+            suffix = match.group("colon_suffix") or ""
+            return f"{match.group('target')}{separator}{quote}{_REDACTED}{quote}{suffix}"
+
+        return match.group(0)
 
     return _SENSITIVE_ASSIGNMENT.sub(replacement, text), replaced
 
