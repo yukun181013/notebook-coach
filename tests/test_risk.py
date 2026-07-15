@@ -142,6 +142,125 @@ def test_ast_tracks_path_instances_and_class_method_delete_calls(
     assert result["blocked"] is True
 
 
+@pytest.mark.parametrize("method", ["unlink", "rmdir"])
+def test_path_instance_alias_propagates_to_delete_calls(
+    snapshot_factory: SnapshotFactory,
+    method: str,
+):
+    source = (
+        "from pathlib import Path\n"
+        "p = Path('/tmp/x')\n"
+        "q = p\n"
+        f"q.{method}()"
+    )
+
+    result = scan_snapshot(snapshot_factory([source]))
+
+    assert _finding_for(result, "filesystem_delete")["severity"] == "high"
+    assert result["blocked"] is True
+
+
+def test_nested_function_rebinding_does_not_clear_outer_path_binding(
+    snapshot_factory: SnapshotFactory,
+):
+    source = (
+        "from pathlib import Path\n"
+        "p = Path('/tmp/x')\n"
+        "def unused():\n"
+        "    p = object()\n"
+        "p.unlink()"
+    )
+
+    result = scan_snapshot(snapshot_factory([source]))
+
+    assert _finding_for(result, "filesystem_delete")["severity"] == "high"
+    assert result["blocked"] is True
+
+
+def test_function_parameters_and_locals_are_scope_isolated(
+    snapshot_factory: SnapshotFactory,
+):
+    snapshot = snapshot_factory(
+        [
+            (
+                "from pathlib import Path\n"
+                "def cleanup():\n"
+                "    local = Path('/tmp/x')\n"
+                "    local.unlink()"
+            ),
+            (
+                "from pathlib import Path\n"
+                "p = Path('/tmp/x')\n"
+                "def cleanup(p):\n"
+                "    p.unlink()"
+            ),
+            (
+                "from pathlib import Path\n"
+                "def remember():\n"
+                "    local = Path('/tmp/x')\n"
+                "local.unlink()"
+            ),
+        ]
+    )
+
+    result = scan_snapshot(snapshot)
+
+    delete_findings = [
+        finding
+        for finding in result["findings"]
+        if finding["category"] == "filesystem_delete"
+    ]
+    assert [finding["cell_index"] for finding in delete_findings] == [0]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "class Path:\n"
+            "    def unlink(self): pass\n"
+            "Path().unlink()"
+        ),
+        (
+            "from pathlib import Path\n"
+            "class Fake:\n"
+            "    def unlink(self): pass\n"
+            "Path = Fake\n"
+            "Path().unlink()"
+        ),
+        (
+            "from pathlib import Path as P\n"
+            "class Fake:\n"
+            "    def rmdir(self): pass\n"
+            "P = Fake\n"
+            "P().rmdir()"
+        ),
+        (
+            "import pathlib as paths\n"
+            "class Fake:\n"
+            "    def unlink(self): pass\n"
+            "class Namespace:\n"
+            "    Path = Fake\n"
+            "paths = Namespace()\n"
+            "paths.Path().unlink()"
+        ),
+        (
+            "from pathlib import Path\n"
+            "class Path:\n"
+            "    def rmdir(self): pass\n"
+            "Path().rmdir()"
+        ),
+    ],
+)
+def test_only_imported_path_symbols_establish_constructor_identity(
+    snapshot_factory: SnapshotFactory,
+    source: str,
+):
+    result = scan_snapshot(snapshot_factory([source]))
+
+    assert result == {"blocked": False, "findings": []}
+
+
 def test_path_tracking_does_not_flag_arbitrary_same_named_methods(
     snapshot_factory: SnapshotFactory,
 ):

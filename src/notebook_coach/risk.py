@@ -132,12 +132,83 @@ def _literal_path(node: ast.AST) -> str | None:
     return None
 
 
+_PATH_UNKNOWN = "unknown"
+_PATH_MODULE = "module"
+_PATH_CONSTRUCTOR = "constructor"
+_PATH_INSTANCE = "instance"
+
+
+class _FunctionBindingCollector(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.names: set[str] = set()
+        self.global_names: set[str] = set()
+        self.nonlocal_names: set[str] = set()
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, ast.Store):
+            self.names.add(node.id)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            self.names.add(alias.asname or _module_root(alias.name))
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        for alias in node.names:
+            if alias.name != "*":
+                self.names.add(alias.asname or alias.name)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.names.add(node.name)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.names.add(node.name)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.names.add(node.name)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        return
+
+    def visit_Global(self, node: ast.Global) -> None:
+        self.global_names.update(node.names)
+
+    def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
+        self.nonlocal_names.update(node.names)
+
+
+def _argument_names(arguments: ast.arguments) -> set[str]:
+    names = {
+        argument.arg
+        for argument in (
+            *arguments.posonlyargs,
+            *arguments.args,
+            *arguments.kwonlyargs,
+        )
+    }
+    if arguments.vararg is not None:
+        names.add(arguments.vararg.arg)
+    if arguments.kwarg is not None:
+        names.add(arguments.kwarg.arg)
+    return names
+
+
+def _function_local_names(
+    arguments: ast.arguments, body: list[ast.stmt]
+) -> set[str]:
+    collector = _FunctionBindingCollector()
+    for statement in body:
+        collector.visit(statement)
+    return (
+        _argument_names(arguments) | collector.names
+    ) - collector.global_names - collector.nonlocal_names
+
+
 class _RiskVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         self.categories: set[str] = set()
         self.module_aliases: dict[str, str] = {}
         self.imported_names: dict[str, str] = {}
-        self.path_instances: set[str] = set()
+        self.path_scopes: list[tuple[str, dict[str, str]]] = [("module", {})]
 
     def _resolve_name(self, node: ast.AST) -> str | None:
         name = _qualified_name(node)
@@ -155,8 +226,27 @@ class _RiskVisitor(ast.NodeVisitor):
             return module + (separator + remainder if separator else "")
         return name
 
+    def _lookup_path_name(self, name: str) -> str:
+        skip_class_scopes = self.path_scopes[-1][0] == "function"
+        for scope_kind, bindings in reversed(self.path_scopes):
+            if skip_class_scopes and scope_kind == "class":
+                continue
+            if name in bindings:
+                return bindings[name]
+        return _PATH_UNKNOWN
+
+    def _path_identity(self, node: ast.AST) -> str:
+        if isinstance(node, ast.Name):
+            return self._lookup_path_name(node.id)
+        if isinstance(node, ast.Attribute) and node.attr == "Path":
+            if self._path_identity(node.value) == _PATH_MODULE:
+                return _PATH_CONSTRUCTOR
+        if isinstance(node, ast.Call) and self._is_path_constructor(node.func):
+            return _PATH_INSTANCE
+        return _PATH_UNKNOWN
+
     def _is_path_constructor(self, node: ast.AST) -> bool:
-        return self._resolve_name(node) in {"Path", "pathlib.Path"}
+        return self._path_identity(node) == _PATH_CONSTRUCTOR
 
     def _is_path_constructor_call(self, node: ast.AST) -> bool:
         return isinstance(node, ast.Call) and self._is_path_constructor(node.func)
@@ -169,21 +259,33 @@ class _RiskVisitor(ast.NodeVisitor):
             return None
         return _literal_path(node.args[0])
 
-    def _bind_path_target(self, target: ast.AST, *, is_path: bool) -> None:
+    def _bind_path_name(self, name: str, identity: str) -> None:
+        self.path_scopes[-1][1][name] = identity
+
+    def _bind_path_target(self, target: ast.AST, identity: str) -> None:
         if isinstance(target, ast.Name):
-            if is_path:
-                self.path_instances.add(target.id)
-            else:
-                self.path_instances.discard(target.id)
+            self._bind_path_name(target.id, identity)
         elif isinstance(target, (ast.List, ast.Tuple)):
             for element in target.elts:
-                self._bind_path_target(element, is_path=is_path)
+                self._bind_path_target(element, _PATH_UNKNOWN)
+
+    def _push_path_scope(
+        self, scope_kind: str, bindings: dict[str, str] | None = None
+    ) -> None:
+        self.path_scopes.append((scope_kind, bindings or {}))
+
+    def _pop_path_scope(self) -> None:
+        self.path_scopes.pop()
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
             root = _module_root(alias.name)
             local_name = alias.asname or root
             self.module_aliases[local_name] = alias.name if alias.asname else root
+            self._bind_path_name(
+                local_name,
+                _PATH_MODULE if alias.name == "pathlib" else _PATH_UNKNOWN,
+            )
             if root == "subprocess":
                 self.categories.add("subprocess")
             if root in _NETWORK_MODULES:
@@ -203,20 +305,100 @@ class _RiskVisitor(ast.NodeVisitor):
                 continue
             local_name = alias.asname or alias.name
             self.imported_names[local_name] = f"{module}.{alias.name}"
+            self._bind_path_name(
+                local_name,
+                _PATH_CONSTRUCTOR
+                if module == "pathlib" and alias.name == "Path"
+                else _PATH_UNKNOWN,
+            )
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:
         self.generic_visit(node)
-        is_path = self._is_path_constructor_call(node.value)
+        identity = self._path_identity(node.value)
         for target in node.targets:
-            self._bind_path_target(target, is_path=is_path)
+            self._bind_path_target(target, identity)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         self.generic_visit(node)
-        is_path = self._resolve_name(node.annotation) == "pathlib.Path" or (
-            node.value is not None and self._is_path_constructor_call(node.value)
+        identity = (
+            self._path_identity(node.value)
+            if node.value is not None
+            else _PATH_UNKNOWN
         )
-        self._bind_path_target(node.target, is_path=is_path)
+        if self._path_identity(node.annotation) == _PATH_CONSTRUCTOR:
+            identity = _PATH_INSTANCE
+        self._bind_path_target(node.target, identity)
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self.generic_visit(node)
+        self._bind_path_target(node.target, self._path_identity(node.value))
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        self.generic_visit(node)
+        self._bind_path_target(node.target, _PATH_UNKNOWN)
+
+    def _visit_function(
+        self, node: ast.FunctionDef | ast.AsyncFunctionDef
+    ) -> None:
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        for default in (*node.args.defaults, *node.args.kw_defaults):
+            if default is not None:
+                self.visit(default)
+        for argument in (
+            *node.args.posonlyargs,
+            *node.args.args,
+            *node.args.kwonlyargs,
+        ):
+            if argument.annotation is not None:
+                self.visit(argument.annotation)
+        for argument in (node.args.vararg, node.args.kwarg):
+            if argument is not None and argument.annotation is not None:
+                self.visit(argument.annotation)
+        if node.returns is not None:
+            self.visit(node.returns)
+
+        self._bind_path_name(node.name, _PATH_UNKNOWN)
+        local_bindings = {
+            name: _PATH_UNKNOWN
+            for name in _function_local_names(node.args, node.body)
+        }
+        self._push_path_scope("function", local_bindings)
+        for statement in node.body:
+            self.visit(statement)
+        self._pop_path_scope()
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._visit_function(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._visit_function(node)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        for default in (*node.args.defaults, *node.args.kw_defaults):
+            if default is not None:
+                self.visit(default)
+        local_bindings = {
+            name: _PATH_UNKNOWN for name in _argument_names(node.args)
+        }
+        self._push_path_scope("function", local_bindings)
+        self.visit(node.body)
+        self._pop_path_scope()
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        for base in node.bases:
+            self.visit(base)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
+
+        self._bind_path_name(node.name, _PATH_UNKNOWN)
+        self._push_path_scope("class")
+        for statement in node.body:
+            self.visit(statement)
+        self._pop_path_scope()
 
     def visit_Call(self, node: ast.Call) -> None:
         call_name = self._resolve_name(node.func)
@@ -237,13 +419,8 @@ class _RiskVisitor(ast.NodeVisitor):
             if (
                 node.func.attr in _PATH_DELETE_METHODS
                 and (
-                    self._is_path_constructor_call(receiver)
-                    or (
-                        isinstance(receiver, ast.Name)
-                        and receiver.id in self.path_instances
-                    )
-                    or call_name
-                    == f"pathlib.Path.{node.func.attr}"
+                    self._path_identity(receiver) == _PATH_INSTANCE
+                    or self._path_identity(receiver) == _PATH_CONSTRUCTOR
                 )
             ):
                 self.categories.add("filesystem_delete")
