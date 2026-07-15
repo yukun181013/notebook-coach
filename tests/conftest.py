@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
@@ -126,3 +128,34 @@ def snapshot_factory() -> Callable[[list[str]], dict]:
         }
 
     return make_snapshot
+
+
+@pytest.fixture
+def baseline_factory() -> Callable[..., Path]:
+    """Create a minimal finalized run for resolution tests."""
+
+    def make_baseline(
+        store,
+        *,
+        source_path: str | Path,
+        run_id: str,
+    ) -> Path:
+        canonical = str(Path(source_path).expanduser().resolve(strict=False))
+        source_id = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:8]
+        source_name = Path(canonical).stem
+        run_dir = store.output_root / f"{source_name}-{source_id}" / run_id
+        run_dir.mkdir(parents=True)
+        (run_dir / "baseline.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "run_id": run_id,
+                    "source": {"path": canonical, "sha256": "a" * 64},
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        return run_dir
+
+    return make_baseline
