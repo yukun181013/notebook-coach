@@ -36,52 +36,71 @@ _NAMED_PATTERNS = (
     ),
 )
 
-_SENSITIVE_NAME_PATTERN = (
-    r"[A-Za-z0-9_.-]*"
-    r"(?:api[_-]?key|token|password|secret)"
-    r"[A-Za-z0-9_.-]*"
-)
+_ASSIGNMENT_NAME_PATTERN = r"[A-Za-z_][A-Za-z0-9_.-]*"
 
-_SENSITIVE_TARGET = re.compile(
+_ASSIGNMENT_TARGET = re.compile(
     rf"""
     (?:
         (?P<subscript>
             [A-Za-z_][A-Za-z0-9_.]*[ \t]*\[[ \t]*
             (?P<subscript_quote>["'])
-            (?P<subscript_name>{_SENSITIVE_NAME_PATTERN})
+            (?P<subscript_name>{_ASSIGNMENT_NAME_PATTERN})
             (?P=subscript_quote)
             [ \t]*\]
         )
         |
-        (?P<simple>
-            (?P<key_quote>["']?)
-            (?P<simple_name>{_SENSITIVE_NAME_PATTERN})
+        (?P<quoted>
+            (?P<key_quote>["'])
+            (?P<quoted_name>{_ASSIGNMENT_NAME_PATTERN})
             (?P=key_quote)
+        )
+        |
+        (?P<simple>
+            (?<![A-Za-z0-9_.-])
+            (?P<simple_name>{_ASSIGNMENT_NAME_PATTERN})
         )
     )
     """,
-    re.IGNORECASE | re.VERBOSE,
+    re.VERBOSE,
 )
 
-_PYTHON_TYPE_ATOM_PATTERN = (
+_PYTHON_ANNOTATION_ATOM_PATTERN = (
     r"(?:"
-    r"str|bytes|int|float|bool|complex|object|None|Any"
-    r"|list|dict|tuple|set|frozenset"
-    r"|(?:typing\.)?[A-Z][A-Za-z0-9_.]*"
+    r'"(?:\\.|[^"\\\r\n])*"'
+    r"|'(?:\\.|[^'\\\r\n])*'"
+    r"|[A-Za-z_][A-Za-z0-9_.]*(?:[ \t]*\[[^=\r\n]*\])?"
     r")"
-    r"(?:[ \t]*\[[^=\r\n]*\])?"
 )
 
 _PYTHON_ANNOTATION = re.compile(
     rf"""
     [ \t]*
-    {_PYTHON_TYPE_ATOM_PATTERN}
-    (?:[ \t]*\|[ \t]*{_PYTHON_TYPE_ATOM_PATTERN})*
+    (?P<annotation>
+        {_PYTHON_ANNOTATION_ATOM_PATTERN}
+        (?:[ \t]*\|[ \t]*{_PYTHON_ANNOTATION_ATOM_PATTERN})*
+    )
     [ \t]*
-    (?P<terminator>=|[,):#]|$)
+    (?P<terminator>=|[,):#]|\r?\n|$)
     """,
     re.VERBOSE,
 )
+
+_TOKEN_METADATA_COMPONENTS = {
+    "budget",
+    "budgets",
+    "count",
+    "counts",
+    "id",
+    "ids",
+    "length",
+    "limit",
+    "limits",
+    "type",
+    "usage",
+    "used",
+}
+_TOKEN_METADATA_PREFIXES = {"max", "min", "num", "total"}
+_BRACKET_PAIRS = {"(": ")", "[": "]", "{": "}"}
 
 
 def _replace_pattern(text: str, pattern: re.Pattern[str]) -> tuple[str, bool]:
@@ -89,170 +108,369 @@ def _replace_pattern(text: str, pattern: re.Pattern[str]) -> tuple[str, bool]:
     return cleaned, count > 0
 
 
+def _target_name(target: re.Match[str]) -> str:
+    return next(
+        name
+        for name in (
+            target.group("subscript_name"),
+            target.group("quoted_name"),
+            target.group("simple_name"),
+        )
+        if name is not None
+    )
+
+
+def _is_sensitive_name(name: str) -> bool:
+    components = [
+        component
+        for component in re.split(r"[_.-]+", name.casefold())
+        if component
+    ]
+    if any(component in {"apikey", "password", "secret"} for component in components):
+        return True
+    if any(
+        components[index : index + 2] == ["api", "key"]
+        for index in range(len(components) - 1)
+    ):
+        return True
+
+    for index, component in enumerate(components):
+        if component != "token":
+            continue
+        previous = components[index - 1] if index else None
+        following = components[index + 1] if index + 1 < len(components) else None
+        if previous in _TOKEN_METADATA_PREFIXES:
+            continue
+        if following in _TOKEN_METADATA_COMPONENTS:
+            continue
+        return True
+    return False
+
+
 def _is_sensitive_assignment(name: str, value: str) -> bool:
+    if not _is_sensitive_name(name):
+        return False
     stripped_value = value.strip()
-    if not stripped_value or stripped_value.casefold() in {
+    return bool(stripped_value) and stripped_value.casefold() not in {
         _REDACTED.casefold(),
         "none",
         "null",
         "true",
         "false",
-    }:
-        return False
-
-    normalized_name = re.sub(r"[.-]", "_", name.casefold())
-    if normalized_name.endswith("_count") and re.fullmatch(
-        r"[+-]?\d+(?:\.\d+)?", stripped_value
-    ):
-        return False
-
-    return True
+    }
 
 
-def _skip_horizontal_space(line: str, start: int) -> int:
-    while start < len(line) and line[start] in " \t":
+def _skip_horizontal_space(text: str, start: int) -> int:
+    while start < len(text) and text[start] in " \t":
         start += 1
     return start
 
 
-def _assignment_value_start(line: str, target_end: int) -> int | None:
-    separator = _skip_horizontal_space(line, target_end)
-    if separator >= len(line):
+def _looks_like_python_annotation(annotation: str) -> bool:
+    annotation = annotation.strip()
+    simple_annotations = {
+        "Any",
+        "None",
+        "bool",
+        "bytes",
+        "complex",
+        "float",
+        "int",
+        "object",
+        "str",
+    }
+
+    if annotation[:1] in {"\"", "'"} and annotation[-1:] == annotation[:1]:
+        forwarded = annotation[1:-1]
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*(?:\[[^\r\n]*\])?", forwarded):
+            return False
+        final_name = forwarded.rsplit(".", 1)[-1].split("[", 1)[0]
+        return (
+            "[" in forwarded
+            or final_name in simple_annotations
+            or final_name[:1].isupper()
+        )
+
+    first_name = annotation.split("[", 1)[0].split("|", 1)[0].strip()
+    return (
+        "." in annotation
+        or "[" in annotation
+        or "|" in annotation
+        or first_name in simple_annotations
+        or first_name[:1].isupper()
+    )
+
+
+def _assignment_value_start(
+    text: str, target: re.Match[str]
+) -> tuple[int, str] | None:
+    separator = _skip_horizontal_space(text, target.end())
+    if separator >= len(text):
         return None
 
-    if line[separator] == "=":
-        return _skip_horizontal_space(line, separator + 1)
-    if line[separator] != ":":
+    if text[separator] == "=":
+        return _skip_horizontal_space(text, separator + 1), "equals"
+    if text[separator] != ":":
         return None
 
-    annotation = _PYTHON_ANNOTATION.match(line, separator + 1)
-    if annotation is None:
-        return _skip_horizontal_space(line, separator + 1)
-    if annotation.group("terminator") != "=":
-        return None
-    return _skip_horizontal_space(line, annotation.end())
+    if target.group("simple_name") is not None:
+        annotation = _PYTHON_ANNOTATION.match(text, separator + 1)
+        if annotation is not None and _looks_like_python_annotation(
+            annotation.group("annotation")
+        ):
+            if annotation.group("terminator") != "=":
+                return None
+            return _skip_horizontal_space(text, annotation.end()), "equals"
+
+    return _skip_horizontal_space(text, separator + 1), "colon"
 
 
-def _scan_quoted_value(line: str, start: int) -> tuple[int, int, str]:
-    quote = line[start]
-    cursor = start + 1
-    while cursor < len(line):
-        if line[cursor] == "\\" and cursor + 1 < len(line):
+def _line_start(text: str, position: int) -> int:
+    return max(text.rfind("\n", 0, position), text.rfind("\r", 0, position)) + 1
+
+
+def _line_end(text: str, position: int) -> int:
+    newline = text.find("\n", position)
+    carriage_return = text.find("\r", position)
+    candidates = [index for index in (newline, carriage_return) if index != -1]
+    return min(candidates) if candidates else len(text)
+
+
+def _after_line_break(text: str, position: int) -> int:
+    if position >= len(text):
+        return position
+    if text.startswith("\r\n", position):
+        return position + 2
+    return position + 1
+
+
+def _indent_width(text: str, line_start: int) -> int:
+    width = 0
+    while line_start < len(text) and text[line_start] in " \t":
+        width += 4 if text[line_start] == "\t" else 1
+        line_start += 1
+    return width
+
+
+def _semicolon_starts_statement(text: str, semicolon: int) -> bool:
+    cursor = _skip_horizontal_space(text, semicolon + 1)
+    if cursor >= len(text) or text[cursor] in "\r\n#":
+        return True
+
+    statement = re.match(r"[A-Za-z_][A-Za-z0-9_.]*", text[cursor:])
+    if statement is None:
+        return False
+    word = statement.group(0)
+    if word in {
+        "assert",
+        "break",
+        "continue",
+        "del",
+        "import",
+        "pass",
+        "raise",
+        "return",
+    }:
+        return True
+    after_name = _skip_horizontal_space(text, cursor + statement.end())
+    return after_name < len(text) and text[after_name] in "(=:"
+
+
+def _scan_quoted_token(text: str, start: int, delimiter: str) -> int | None:
+    cursor = start + len(delimiter)
+    while cursor < len(text):
+        if text[cursor] == "\\" and cursor + 1 < len(text):
             cursor += 2
             continue
-        if line[cursor] == quote:
-            return start + 1, cursor, line[start + 1 : cursor]
+        if text.startswith(delimiter, cursor):
+            return cursor + len(delimiter)
+        if len(delimiter) == 1 and text[cursor] in "\r\n":
+            return None
         cursor += 1
-    return start + 1, len(line), line[start + 1 :]
+    return None
 
 
-def _scan_container_value(line: str, start: int) -> tuple[int, int, str]:
-    closing_for = {"[": "]", "{": "}", "(": ")"}
-    stack = [closing_for[line[start]]]
-    cursor = start + 1
+def _is_rhs_boundary(text: str, position: int) -> bool:
+    position = _skip_horizontal_space(text, position)
+    if position >= len(text) or text[position] in "\r\n,)}]#":
+        return True
+    return text[position] == ";" and _semicolon_starts_statement(text, position)
+
+
+def _is_yaml_block_header(text: str, start: int) -> bool:
+    header = text[start : _line_end(text, start)]
+    return bool(
+        re.fullmatch(r"[|>](?:[1-9][+-]?|[+-][1-9]?)?[ \t]*(?:#.*)?", header)
+    )
+
+
+def _scan_yaml_block(
+    text: str, start: int, target_start: int
+) -> tuple[int, int, str, int]:
+    header_end = _line_end(text, start)
+    block_end = header_end
+    base_indent = _indent_width(text, _line_start(text, target_start))
+    line_start = _after_line_break(text, header_end)
+
+    while line_start < len(text):
+        line_end = _line_end(text, line_start)
+        line = text[line_start:line_end]
+        if line.strip() and _indent_width(text, line_start) <= base_indent:
+            break
+        block_end = line_end
+        if line_end >= len(text):
+            break
+        line_start = _after_line_break(text, line_end)
+
+    return start, block_end, text[start:block_end], block_end
+
+
+def _scan_expression_value(
+    text: str, start: int
+) -> tuple[int, int, str, int] | None:
+    stack: list[str] = []
     quote: str | None = None
+    in_comment = False
+    cursor = start
 
-    while cursor < len(line):
-        character = line[cursor]
+    while cursor < len(text):
+        character = text[cursor]
+
+        if in_comment:
+            if character in "\r\n":
+                if not stack:
+                    break
+                in_comment = False
+                cursor = _after_line_break(text, cursor)
+                continue
+            cursor += 1
+            continue
+
         if quote is not None:
-            if character == "\\" and cursor + 1 < len(line):
+            if character == "\\" and cursor + 1 < len(text):
                 cursor += 2
                 continue
-            if character == quote:
+            if text.startswith(quote, cursor):
+                cursor += len(quote)
                 quote = None
-        elif character in "\"'":
+                continue
+            if len(quote) == 1 and character in "\r\n":
+                break
+            cursor += 1
+            continue
+
+        if text.startswith(('"""', "'''"), cursor):
+            quote = text[cursor : cursor + 3]
+            cursor += 3
+            continue
+        if character in "\"'":
             quote = character
-        elif character in closing_for:
-            stack.append(closing_for[character])
-        elif character == stack[-1]:
-            stack.pop()
+            cursor += 1
+            continue
+        if character == "#":
+            in_comment = True
+            cursor += 1
+            continue
+        if character in _BRACKET_PAIRS:
+            stack.append(_BRACKET_PAIRS[character])
+            cursor += 1
+            continue
+        if character in ")]}":
             if not stack:
-                return start, cursor + 1, line[start : cursor + 1]
-        cursor += 1
-
-    return start, len(line), line[start:]
-
-
-def _scan_bare_value(line: str, start: int) -> tuple[int, int, str] | None:
-    cursor = start
-    while cursor < len(line):
-        character = line[cursor]
-        if character in ",)}]":
+                break
+            if character == stack[-1]:
+                stack.pop()
+            cursor += 1
+            continue
+        if not stack and character == ",":
             break
-        if character == ";" and (
-            cursor + 1 == len(line) or line[cursor + 1].isspace()
+        if (
+            not stack
+            and character == ";"
+            and _semicolon_starts_statement(text, cursor)
         ):
             break
+        if character in "\r\n" and not stack:
+            break
+        if character in "\r\n":
+            cursor = _after_line_break(text, cursor)
+            continue
         cursor += 1
 
     end = cursor
-    while end > start and line[end - 1] in " \t":
+    while end > start and text[end - 1] in " \t":
         end -= 1
     if end == start:
         return None
-    return start, end, line[start:end]
+    return start, end, text[start:end], cursor
 
 
-def _scan_assignment_value(line: str, start: int) -> tuple[int, int, str] | None:
-    if start >= len(line):
+def _scan_assignment_value(
+    text: str, start: int, style: str, target_start: int
+) -> tuple[int, int, str, int] | None:
+    if start >= len(text):
         return None
-    if line[start] in "\"'":
-        return _scan_quoted_value(line, start)
-    if line[start] in "[{(":
-        return _scan_container_value(line, start)
-    return _scan_bare_value(line, start)
+
+    if style == "colon" and text[start] in "|>" and _is_yaml_block_header(text, start):
+        return _scan_yaml_block(text, start, target_start)
+
+    delimiter = None
+    if text.startswith(('"""', "'''"), start):
+        delimiter = text[start : start + 3]
+    elif text[start] in "\"'":
+        delimiter = text[start]
+
+    if delimiter is not None:
+        quoted_end = _scan_quoted_token(text, start, delimiter)
+        if quoted_end is not None and _is_rhs_boundary(text, quoted_end):
+            content_start = start + len(delimiter)
+            content_end = quoted_end - len(delimiter)
+            return (
+                content_start,
+                content_end,
+                text[content_start:content_end],
+                quoted_end,
+            )
+
+    return _scan_expression_value(text, start)
 
 
-def _redact_assignment_line(line: str) -> tuple[str, bool]:
+def _redact_sensitive_assignments(text: str) -> tuple[str, bool]:
     output: list[str] = []
     copied_until = 0
     search_from = 0
     replaced = False
 
-    while target := _SENSITIVE_TARGET.search(line, search_from):
-        value_start = _assignment_value_start(line, target.end())
-        if value_start is None:
+    while target := _ASSIGNMENT_TARGET.search(text, search_from):
+        name = _target_name(target)
+        if not _is_sensitive_name(name):
             search_from = target.end()
             continue
 
-        value = _scan_assignment_value(line, value_start)
+        assignment = _assignment_value_start(text, target)
+        if assignment is None:
+            search_from = target.end()
+            continue
+        value_start, style = assignment
+
+        value = _scan_assignment_value(text, value_start, style, target.start())
         if value is None:
             search_from = max(target.end(), value_start + 1)
             continue
+        replace_start, replace_end, original_value, resume_at = value
 
-        replace_start, replace_end, original_value = value
-        name = target.group("simple_name") or target.group("subscript_name")
         if not _is_sensitive_assignment(name, original_value):
-            search_from = max(target.end(), replace_end)
+            search_from = max(target.end(), resume_at)
             continue
 
-        output.append(line[copied_until:replace_start])
+        output.append(text[copied_until:replace_start])
         output.append(_REDACTED)
         copied_until = replace_end
-        search_from = replace_end
+        search_from = max(replace_end, resume_at)
         replaced = True
 
-    output.append(line[copied_until:])
+    output.append(text[copied_until:])
     return "".join(output), replaced
-
-
-def _redact_sensitive_assignments(text: str) -> tuple[str, bool]:
-    cleaned_lines: list[str] = []
-    replaced = False
-
-    for line in text.splitlines(keepends=True):
-        if line.endswith("\r\n"):
-            body, ending = line[:-2], "\r\n"
-        elif line.endswith(("\r", "\n")):
-            body, ending = line[:-1], line[-1]
-        else:
-            body, ending = line, ""
-
-        cleaned, line_replaced = _redact_assignment_line(body)
-        cleaned_lines.append(cleaned + ending)
-        replaced = replaced or line_replaced
-
-    return "".join(cleaned_lines), replaced
 
 
 def redact_text(text: str) -> tuple[str, list[str]]:
