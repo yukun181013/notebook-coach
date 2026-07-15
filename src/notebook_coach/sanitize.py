@@ -209,7 +209,11 @@ def _assignment_value_start(
         return None
 
     if text[separator] == "=":
+        if text.startswith("==", separator):
+            return None
         return _skip_horizontal_space(text, separator + 1), "equals"
+    if text.startswith(":=", separator):
+        return _skip_horizontal_space(text, separator + 2), "equals"
     if text[separator] != ":":
         return None
 

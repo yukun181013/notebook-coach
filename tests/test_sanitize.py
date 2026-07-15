@@ -222,6 +222,49 @@ def test_redacts_rhs_before_no_space_semicolon_statement():
     assert labels == ["sensitive_assignment"]
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        'password == "x"',
+        'if password == "x": pass',
+        '"password" == candidate',
+    ],
+)
+def test_does_not_redact_comparisons_using_sensitive_names(text):
+    assert redact_text(text) == (text, [])
+    assert summarize_text(text)["text"] == text
+
+
+@pytest.mark.parametrize(
+    ("text", "expected", "secret_fragments"),
+    [
+        (
+            'password := "synthetic-secret-value"',
+            'password := "[REDACTED]"',
+            ("synthetic-secret-value",),
+        ),
+        (
+            'if (password := get_secret("alpha,beta")): pass',
+            "if (password := [REDACTED]): pass",
+            ("alpha", "beta"),
+        ),
+    ],
+)
+def test_redacts_walrus_assignment_rhs_and_preserves_operator(
+    text, expected, secret_fragments
+):
+    cleaned, labels = redact_text(text)
+    summary = summarize_text(text)
+
+    assert cleaned == expected
+    assert summary["text"] == expected
+    assert all(
+        fragment not in repr((cleaned, labels)) for fragment in secret_fragments
+    )
+    assert all(fragment not in repr(summary) for fragment in secret_fragments)
+    assert labels == ["sensitive_assignment"]
+
+
 def test_redacts_python_annotated_sensitive_assignment_rhs():
     secret = "synthetic-secret-value"
 
