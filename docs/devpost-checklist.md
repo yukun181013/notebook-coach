@@ -22,8 +22,8 @@
 - [x] Script follows a 0:00–3:00 timeline.
 - [x] Narration choice confirmed by the user.
 - [x] Exported video duration is strictly under three minutes: 118.08 seconds.
-- [ ] Public YouTube upload explicitly approved and anonymously playable.
-- [ ] Public YouTube URL recorded after upload approval.
+- [x] Public YouTube upload explicitly approved and anonymously playable.
+- [x] Public YouTube URL recorded after upload approval: https://youtu.be/AkKbNcasbzM
 
 ## Final verification
 

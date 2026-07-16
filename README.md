@@ -12,6 +12,12 @@ Inspect the complete pre-generated example immediately:
 - [Verification report](examples/transformer_attention_buggy/verification.md)
 - [Evaluation notes](examples/transformer_attention_buggy/evaluation.md)
 
+## Demo
+
+Watch the public 1:58 walkthrough: [Notebook Coach — Evidence-Linked Jupyter Learning | OpenAI Build Week](https://youtu.be/AkKbNcasbzM).
+
+The demo covers installation, evidence-linked diagnosis, answer-free challenge generation, and measurable recheck without requiring an OpenAI API key.
+
 ## Install
 
 Requirements: Python 3.11, macOS or Linux, and Codex CLI/Desktop. Native Windows and WSL are currently unverified.
