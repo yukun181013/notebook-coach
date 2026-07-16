@@ -14,8 +14,8 @@
 - [x] Education track story is explicit.
 - [x] GPT-5.6 is named as the Codex teaching-judgment model.
 - [x] Codex development and local Python responsibilities are explained.
-- [ ] `/feedback` Session ID captured privately: no.
-- [ ] Private note records the real Session ID, model, and date.
+- [x] `/feedback` Session ID captured privately.
+- [x] Private note records the real Session ID, model, and date.
 
 ## Demo video
 
