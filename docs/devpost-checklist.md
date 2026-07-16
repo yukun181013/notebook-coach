@@ -32,6 +32,6 @@
 - [x] Static diagnosis acceptance completes in 0.06 seconds, under five minutes.
 - [x] Static diagnosis acceptance preserves the source hash and kernel process set.
 - [x] Public URLs contain no placeholders.
-- [ ] User has reviewed the final Devpost field summary.
-- [ ] Final Devpost Submit action explicitly approved.
-- [ ] Devpost project page shows submitted rather than draft.
+- [x] User reviewed the final Devpost field summary.
+- [x] Final Devpost Submit action explicitly approved.
+- [x] Devpost submission `1084770` shows status `Submitted`.
